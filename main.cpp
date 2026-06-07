@@ -15,8 +15,9 @@ static constexpr int WARMUP_FRAMES = 30;
 
 class CaptureSession {
 public:
-    explicit CaptureSession(const StreamConfiguration &sc, Camera *camera)
-        : sc_(sc), camera_(camera) {}
+    explicit CaptureSession(const StreamConfiguration &sc, Camera *camera,
+                            const Rectangle &cropRect)
+        : sc_(sc), camera_(camera), cropRect_(cropRect) {}
 
     void requestCompleted(Request *req)
     {
@@ -27,6 +28,8 @@ public:
 
         if (frameCount_ <= WARMUP_FRAMES) {
             req->reuse(Request::ReuseBuffers);
+            if (cropRect_.width > 0)
+                req->controls().set(controls::ScalerCrop, cropRect_);
             camera_->queueRequest(req);
             return;
         }
@@ -81,6 +84,7 @@ private:
 
     const StreamConfiguration &sc_;
     Camera                    *camera_;
+    Rectangle                  cropRect_;
     std::mutex                 mtx_;
     std::condition_variable    cv_;
     bool                       done_       = false;
@@ -136,6 +140,22 @@ int main()
 
     Stream *stream = sc.stream();
 
+    Rectangle sensorCrop;
+    {
+        const auto &props = camera->properties();
+        auto activeAreas = props.get(properties::PixelArrayActiveAreas);
+        if (activeAreas && !activeAreas->empty()) {
+            sensorCrop = (*activeAreas)[0];
+            std::cout << "[capture] sensor active area: " << sensorCrop.toString() << "\n";
+        } else {
+            auto sz = props.get(properties::PixelArraySize);
+            if (sz) {
+                sensorCrop = Rectangle(0, 0, sz->width, sz->height);
+                std::cout << "[capture] sensor pixel array: " << sensorCrop.toString() << "\n";
+            }
+        }
+    }
+
     FrameBufferAllocator alloc(camera);
     if (alloc.allocate(stream) < 0) {
         camera->release(); cm->stop(); return 1;
@@ -145,8 +165,10 @@ int main()
     if (!request || request->addBuffer(stream, alloc.buffers(stream)[0].get())) {
         camera->release(); cm->stop(); return 1;
     }
+    if (sensorCrop.width > 0)
+        request->controls().set(controls::ScalerCrop, sensorCrop);
 
-    CaptureSession session(sc, camera.get());
+    CaptureSession session(sc, camera.get(), sensorCrop);
     camera->requestCompleted.connect(&session, &CaptureSession::requestCompleted);
     std::cout << "[capture] warming up AE/AWB (" << WARMUP_FRAMES << " frames)...\n";
 
