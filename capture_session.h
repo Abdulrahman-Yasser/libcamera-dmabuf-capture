@@ -15,6 +15,7 @@ public:
 
     void requestCompleted(libcamera::Request *req);
     void waitDone();
+    const libcamera::FrameBuffer *capturedBuffer() const { return captured_buf_; }
 
 private:
     void saveRaw(const libcamera::FrameBuffer *buf);
@@ -26,6 +27,7 @@ private:
     libcamera::Camera                    *camera_;
     std::mutex                            mtx_;
     std::condition_variable               cv_;
-    bool                                  done_       = false;
-    int                                   frameCount_ = 0;
+    bool                                  done_        = false;
+    int                                   frameCount_  = 0;
+    const libcamera::FrameBuffer         *captured_buf_ = nullptr;
 };

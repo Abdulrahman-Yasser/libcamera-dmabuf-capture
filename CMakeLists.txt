@@ -21,11 +21,13 @@ pkg_check_modules(DRM      REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(GBM      REQUIRED IMPORTED_TARGET gbm)
 pkg_check_modules(EGL      REQUIRED IMPORTED_TARGET egl)
 pkg_check_modules(GLESV2   REQUIRED IMPORTED_TARGET glesv2)
+pkg_check_modules(PNG      REQUIRED IMPORTED_TARGET libpng)
 
 add_executable(libcamera-dmabuf-capture
     main.cpp
     egl_context.cpp
     capture_session.cpp
+    dmabuf_import.cpp
 )
 
 target_link_libraries(libcamera-dmabuf-capture PRIVATE
@@ -34,6 +36,7 @@ target_link_libraries(libcamera-dmabuf-capture PRIVATE
     PkgConfig::GBM
     PkgConfig::EGL
     PkgConfig::GLESV2
+    PkgConfig::PNG
 )
 
 install(TARGETS libcamera-dmabuf-capture DESTINATION bin)

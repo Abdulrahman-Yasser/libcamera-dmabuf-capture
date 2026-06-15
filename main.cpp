@@ -1,5 +1,6 @@
 #include "egl_context.h"
 #include "capture_session.h"
+#include "dmabuf_import.h"
 
 #include <libcamera/libcamera.h>
 
@@ -107,6 +108,17 @@ int main()
     }
 
     session.waitDone();
+
+    /* ---- Stage 3: DMA-BUF → EGL → NV12→RGB shader → PNG ---- */
+    if (!import_and_save_png(egl, session.capturedBuffer(), sc)) {
+        std::cerr << "[dmabuf] PNG export failed\n";
+        camera->stop();
+        alloc.free(stream);
+        camera->release();
+        cm->stop();
+        teardown_egl(egl);
+        return 1;
+    }
 
     /* ---- Cleanup ---- */
     camera->stop();

@@ -11,7 +11,11 @@ descriptor I can later pass to the GPU.
 - Configures NV12 output at 1640x1232 (IMX219 full-sensor 2x2-binned mode)
 - Waits 30 frames for auto-exposure and auto-white-balance to settle
 - Prints the DMA-BUF fd and plane layout for the captured frame
-- Saves the raw NV12 data to `/tmp/frame.raw`
+- Saves the raw NV12 data to `/tmp/frame.raw` (intermediate debug output)
+- Imports the DMA-BUF fd into EGL as two `GL_TEXTURE_EXTERNAL_OES` textures
+  (Y plane as `DRM_FORMAT_R8`, UV plane as `DRM_FORMAT_RG88`)
+- Runs a GLSL ES 2.0 NV12→RGB shader into an FBO, reads back with `glReadPixels`
+- Saves the colour result as `/tmp/frame.png` via libpng
 
 ## Build
 
@@ -19,12 +23,21 @@ The AGL image doesn't have a compiler on it, so I cross-compile from the host
 using the toolchain that Yocto already built:
 
 ```bash
-chmod +x cross-build.sh
 ./cross-build.sh
 ```
 
-Needs an existing AGL RPi4 Yocto build at
-`/media/abdu/LinuxHome/Embedded_Linux/git_ignoring/AGL/raspberrypi4/`.
+The script runs:
+
+```bash
+source /opt/agl-sdk/21.90.0-aarch64-agl-image-flutter-debug/environment-setup-aarch64-agl-linux
+mkdir -p build
+cd build
+cmake -DCMAKE_TOOLCHAIN_FILE="$CMAKE_TOOLCHAIN_FILE" ..
+make -j$(nproc)
+```
+
+The SDK `environment-setup` script sets `$CMAKE_TOOLCHAIN_FILE` and all the
+cross-compiler environment variables. The binary ends up at `build/libcamera-dmabuf-capture`.
 
 ## Deploy and run
 
@@ -49,12 +62,22 @@ Expected output:
 [capture] raw frame saved to /tmp/frame.raw (1640x1232 NV12, stride=1664)
 ```
 
-## View the raw frame
+## View the raw frame (NV12 debug output)
 
 ```bash
 scp root@<rpi-ip>:/tmp/frame.raw .
 ffplay -f rawvideo -pixel_format nv12 -video_size 1640x1232 frame.raw
 ```
+
+## Verify the PNG (Stage 3 output)
+
+```bash
+scp root@<rpi-ip>:/tmp/frame.png .
+xdg-open frame.png   # or: feh frame.png / open frame.png (macOS)
+```
+
+The PNG should show a recognisable colour image from the camera.
+If it looks correct, the full DMA-BUF → EGL → GPU pipeline is working.
 
 ## Why 1640x1232 and not 1280x720
 

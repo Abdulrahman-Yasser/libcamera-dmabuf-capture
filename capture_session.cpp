@@ -39,6 +39,7 @@ void CaptureSession::requestCompleted(Request *req)
                   << "  length=" << planes[i].length << "\n";
 
     saveRaw(buf);
+    captured_buf_ = buf;
 
     {
         std::lock_guard<std::mutex> lk(mtx_);

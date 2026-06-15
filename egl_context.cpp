@@ -88,9 +88,10 @@ bool setup_egl(EGLState &egl)
         return false;
     }
 
-    /* 8. GLES2 context */
+    /* 8. GLES 3.0 context — needed for GL_RGBA8 renderbuffers and
+     *    #version 300 es shaders (gl_VertexID, out variables, etc.) */
     static const EGLint ctx_attribs[] = {
-        EGL_CONTEXT_CLIENT_VERSION, 2,
+        EGL_CONTEXT_CLIENT_VERSION, 3,
         EGL_NONE
     };
     egl.ctx = eglCreateContext(egl.dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
