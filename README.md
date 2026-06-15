@@ -65,3 +65,4 @@ pixel array — the image looks zoomed in even though the lens is not zoomed.
 1640×1232 is the sensor's 2×2-binned mode: it reads the full 3280×2464 pixel
 array and bins every 2×2 block into one output pixel, giving the correct
 wide-angle field of view at full speed (~40fps).
+
