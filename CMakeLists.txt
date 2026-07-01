@@ -16,12 +16,16 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 
-pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
-pkg_check_modules(DRM      REQUIRED IMPORTED_TARGET libdrm)
-pkg_check_modules(GBM      REQUIRED IMPORTED_TARGET gbm)
-pkg_check_modules(EGL      REQUIRED IMPORTED_TARGET egl)
-pkg_check_modules(GLESV2   REQUIRED IMPORTED_TARGET glesv2)
-pkg_check_modules(PNG      REQUIRED IMPORTED_TARGET libpng)
+pkg_check_modules(LIBCAMERA  REQUIRED IMPORTED_TARGET libcamera)
+pkg_check_modules(DRM        REQUIRED IMPORTED_TARGET libdrm)
+pkg_check_modules(GBM        REQUIRED IMPORTED_TARGET gbm)
+pkg_check_modules(EGL        REQUIRED IMPORTED_TARGET egl)
+pkg_check_modules(GLESV2     REQUIRED IMPORTED_TARGET glesv2)
+pkg_check_modules(PNG        REQUIRED IMPORTED_TARGET libpng)
+pkg_check_modules(GST        REQUIRED IMPORTED_TARGET gstreamer-1.0)
+pkg_check_modules(GST_APP    REQUIRED IMPORTED_TARGET gstreamer-app-1.0)
+pkg_check_modules(GST_ALLOC  REQUIRED IMPORTED_TARGET gstreamer-allocators-1.0)
+pkg_check_modules(GST_VIDEO  REQUIRED IMPORTED_TARGET gstreamer-video-1.0)
 
 add_executable(libcamera-dmabuf-capture
     main.cpp
@@ -29,6 +33,7 @@ add_executable(libcamera-dmabuf-capture
     capture_session.cpp
     gpu_renderer.cpp
     dmabuf_import.cpp
+    file_source.cpp
 )
 
 target_link_libraries(libcamera-dmabuf-capture PRIVATE
@@ -38,6 +43,10 @@ target_link_libraries(libcamera-dmabuf-capture PRIVATE
     PkgConfig::EGL
     PkgConfig::GLESV2
     PkgConfig::PNG
+    PkgConfig::GST
+    PkgConfig::GST_APP
+    PkgConfig::GST_ALLOC
+    PkgConfig::GST_VIDEO
 )
 
 install(TARGETS libcamera-dmabuf-capture DESTINATION bin)

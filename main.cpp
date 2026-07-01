@@ -1,10 +1,12 @@
 #include "egl_context.h"
 #include "capture_session.h"
 #include "gpu_renderer.h"
+#include "file_source.h"
 #include "perf_timer.h"
 
 #include <libcamera/libcamera.h>
 
+#include <algorithm>
 #include <csignal>
 #include <cstdio>
 #include <iostream>
@@ -49,10 +51,134 @@ static void restore_stdin()
     tcsetattr(STDIN_FILENO, TCSANOW, &g_old_tio);
 }
 
-int main()
+// ── Dual file mode ────────────────────────────────────────────────────────────
+
+static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &egl)
+{
+    FileSource lsrc, rsrc;
+    if (!lsrc.open(lpath))  return 1;
+    if (!rsrc.open(rpath))  return 1;
+
+    DmaBufFrame lf = lsrc.nextFrame();
+    DmaBufFrame rf = rsrc.nextFrame();
+    if (!lf.data) { std::cerr << "[dual] failed to get first left frame\n";  return 1; }
+    if (!rf.data) { std::cerr << "[dual] failed to get first right frame\n"; return 1; }
+
+    GpuRenderer renderer;
+    if (!renderer.init_dual(egl, lf.width, lf.height, lf.stride)) return 1;
+
+    enable_raw_stdin();
+    float overlap    = 0.86f;
+    float blend_edge = 0.45f;
+    std::printf("[stitch] overlap=%.2f edge=%.2f  "
+                "+/-=overlap  [/]=sharpness  s=snapshot  Ctrl+C=stop\n",
+                overlap, blend_edge);
+
+    uint64_t total_frames = 0;
+
+    while (g_running && lf.data && rf.data) {
+        renderer.render_frame(lf, rf);
+        ++total_frames;
+
+        char key = 0;
+        if (read(STDIN_FILENO, &key, 1) == 1) {
+            if (key == 's' || key == 'S') {
+                static int snap_idx = 0;
+                char snap_path[64];
+                std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
+                renderer.save_snapshot(snap_path);
+            } else if (key == '+' || key == '=') {
+                overlap = std::min(overlap + 0.01f, 0.95f);
+                renderer.set_stitch_overlap(overlap);
+                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+            } else if (key == '-') {
+                overlap = std::max(overlap - 0.01f, 0.05f);
+                renderer.set_stitch_overlap(overlap);
+                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+            } else if (key == ']') {
+                blend_edge = std::min(blend_edge + 0.01f, 0.49f);
+                renderer.set_blend_edge(blend_edge);
+                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+            } else if (key == '[') {
+                blend_edge = std::max(blend_edge - 0.01f, 0.0f);
+                renderer.set_blend_edge(blend_edge);
+                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+            }
+        }
+
+        lf = lsrc.nextFrame();
+        rf = rsrc.nextFrame();
+    }
+
+    std::printf("[loop] dual mode stopped after %llu frames\n",
+                (unsigned long long)total_frames);
+    restore_stdin();
+    renderer.cleanup();
+    return 0;
+}
+
+// ── Single file mode ──────────────────────────────────────────────────────────
+
+static int run_file_mode(const char *path, EGLState &egl)
+{
+    FileSource fsrc;
+    if (!fsrc.open(path)) return 1;
+
+    // Pull first frame to discover dimensions before initialising the renderer.
+    DmaBufFrame first = fsrc.nextFrame();
+    if (!first.data) {
+        std::cerr << "[file] failed to get first frame\n";
+        return 1;
+    }
+
+    GpuRenderer renderer;
+    if (!renderer.init(egl, first.width, first.height, first.stride)) return 1;
+
+    enable_raw_stdin();
+    std::cout << "[loop] file mode — press 's' to save snapshot, Ctrl+C to stop\n";
+
+    DmaBufFrame frame = first;
+    uint64_t total_frames = 0;
+
+    while (g_running && frame.data) {
+        renderer.render_frame(frame);
+        ++total_frames;
+
+        char key = 0;
+        if (read(STDIN_FILENO, &key, 1) == 1 && (key == 's' || key == 'S')) {
+            static int snap_idx = 0;
+            char snap_path[64];
+            std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
+            renderer.save_snapshot(snap_path);
+        }
+
+        frame = fsrc.nextFrame();
+    }
+
+    std::printf("[loop] file mode stopped after %llu frames\n",
+                (unsigned long long)total_frames);
+    restore_stdin();
+    renderer.cleanup();
+    return 0;
+}
+
+// ── Camera mode ───────────────────────────────────────────────────────────────
+
+int main(int argc, char *argv[])
 {
     std::signal(SIGINT,  [](int){ g_running = 0; });
     std::signal(SIGTERM, [](int){ g_running = 0; });
+
+    // ── Parse arguments ───────────────────────────────────────────────────
+    const char *file_path  = nullptr;
+    const char *file_left  = nullptr;
+    const char *file_right = nullptr;
+    for (int i = 1; i < argc - 1; ++i) {
+        std::string a = argv[i];
+        if (a == "--file")        file_path  = argv[i + 1];
+        else if (a == "--file-left")  file_left  = argv[i + 1];
+        else if (a == "--file-right") file_right = argv[i + 1];
+    }
 
     /* ---- EGL/GBM headless context ---- */
     EGLState egl;
@@ -64,6 +190,17 @@ int main()
         teardown_egl(egl); return 1;
     }
     std::cout << "[egl] context ready\n\n";
+
+    if (file_left && file_right) {
+        int rc = run_dual_file_mode(file_left, file_right, egl);
+        teardown_egl(egl);
+        return rc;
+    }
+    if (file_path) {
+        int rc = run_file_mode(file_path, egl);
+        teardown_egl(egl);
+        return rc;
+    }
 
     /* ---- Camera init ---- */
     auto cm = std::make_unique<CameraManager>();

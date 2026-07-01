@@ -13,6 +13,78 @@ using namespace libcamera;
 
 // ── Shader source ─────────────────────────────────────────────────────────────
 
+// Fragment shader for single system-memory NV12 frame.
+static const char kFS_2D[] = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D uTexY;
+uniform sampler2D uTexUV;
+in  vec2 vTexCoord;
+out vec4 fragColor;
+void main() {
+    vec2  uv = vec2(vTexCoord.x, 1.0 - vTexCoord.y);
+    float Y  = texture(uTexY,  uv).r;
+    vec2  UV = texture(uTexUV, uv).rg - 0.5;
+    float R  = clamp(Y + 1.402  * UV.y,                0.0, 1.0);
+    float G  = clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0);
+    float B  = clamp(Y + 1.772  * UV.x,                0.0, 1.0);
+    fragColor = vec4(R, G, B, 1.0);
+}
+)glsl";
+
+// Seam-stitch shader.
+// uOverlap: fraction of each camera image that overlaps [0..1].
+// Maps output x -> scene_x in [0, 2-overlap]:
+//   left  camera covers scene_x [0,        1]        → cam_u = scene_x
+//   right camera covers scene_x [1-overlap, 2-overlap] → cam_u = scene_x-(1-overlap)
+// Smoothstep blend in the overlap zone.
+static const char kFS_DUAL[] = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D uTexY0;
+uniform sampler2D uTexUV0;
+uniform sampler2D uTexY1;
+uniform sampler2D uTexUV1;
+uniform float uOverlap;
+// Controls sharpness of the crossover within the blend zone.
+// 0.0 = full gradual blend, 0.49 = nearly instant cut.
+// At 0.45: left 45% of blend zone = pure left cam, middle 10% = transition,
+//          right 45% = pure right cam. Minimises parallax ghosting.
+uniform float uBlendEdge;
+in  vec2 vTexCoord;
+out vec4 fragColor;
+
+vec3 nv12_to_rgb(sampler2D sY, sampler2D sUV, vec2 uv) {
+    float Y  = texture(sY,  uv).r;
+    vec2  UV = texture(sUV, uv).rg - 0.5;
+    return vec3(
+        clamp(Y + 1.402  * UV.y,                0.0, 1.0),
+        clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0),
+        clamp(Y + 1.772  * UV.x,                0.0, 1.0));
+}
+
+void main() {
+    vec2  uv      = vec2(vTexCoord.x, 1.0 - vTexCoord.y);
+    float scene_x = uv.x * (2.0 - uOverlap);
+
+    vec2 uv_L = vec2(scene_x,                    uv.y);
+    vec2 uv_R = vec2(scene_x - (1.0 - uOverlap), uv.y);
+
+    vec3 rgb;
+    if (scene_x < (1.0 - uOverlap)) {
+        rgb = nv12_to_rgb(uTexY0, uTexUV0, uv_L);
+    } else if (scene_x > 1.0) {
+        rgb = nv12_to_rgb(uTexY1, uTexUV1, uv_R);
+    } else {
+        float t = (scene_x - (1.0 - uOverlap)) / uOverlap;
+        float s = smoothstep(uBlendEdge, 1.0 - uBlendEdge, t);
+        rgb = mix(nv12_to_rgb(uTexY0, uTexUV0, uv_L),
+                  nv12_to_rgb(uTexY1, uTexUV1, uv_R), s);
+    }
+    fragColor = vec4(rgb, 1.0);
+}
+)glsl";
+
 static const char kVS[] = R"glsl(
 #version 300 es
 out vec2 vTexCoord;
@@ -102,6 +174,63 @@ static GLuint build_program(const char *vs_src, const char *fs_src)
     return prog;
 }
 
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+void GpuRenderer::collect_timer()
+{
+    if (!timer_pending_ || !gpu_stats_.available) return;
+    GLuint64 ns = 0;
+    pfn_GetQuery64(timer_query_, GL_QUERY_RESULT_EXT, &ns);
+    double ms = (double)ns * 1e-6;
+    auto &s = gpu_stats_;
+    if (s.warmup_count < GpuStats::WARMUP_N) s.warmup_ms[s.warmup_count++] = ms;
+    s.sum_ms += ms;
+    if (ms < s.min_ms) s.min_ms = ms;
+    if (ms > s.max_ms) s.max_ms = ms;
+    ++s.frames;
+    timer_pending_ = false;
+}
+
+// Upload one NV12 frame's Y and UV planes to the given GL textures.
+// unit_y / unit_uv are the GL_TEXTUREn indices (0-based).
+void GpuRenderer::upload_nv12(const DmaBufFrame &f,
+                               GLuint tex_y, GLuint tex_uv,
+                               int unit_y, int unit_uv)
+{
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, f.stride);
+    glActiveTexture(GL_TEXTURE0 + unit_y);
+    glBindTexture(GL_TEXTURE_2D, tex_y);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
+                 f.width, f.height, 0,
+                 GL_RED, GL_UNSIGNED_BYTE,
+                 f.data + f.y_offset);
+
+    // UV plane: stride/2 GL_RG pixels per row (2 bytes per pixel).
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, f.stride / 2);
+    glActiveTexture(GL_TEXTURE0 + unit_uv);
+    glBindTexture(GL_TEXTURE_2D, tex_uv);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8,
+                 f.width / 2, f.height / 2, 0,
+                 GL_RG, GL_UNSIGNED_BYTE,
+                 f.data + f.uv_offset);
+
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+}
+
+// Cache a pre-built EGLImage + texture for a given fd.
+void GpuRenderer::cache_frame(int fd, EGLImageKHR img)
+{
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    pfn_TexImage2DOES(GL_TEXTURE_EXTERNAL_OES, img);
+    fd_cache_[fd] = {img, tex};
+}
+
 // ── GpuRenderer ───────────────────────────────────────────────────────────────
 
 bool GpuRenderer::load_ext_fns()
@@ -156,6 +285,111 @@ EGLImageKHR GpuRenderer::create_egl_image(const FrameBuffer *buf)
                            EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
 }
 
+EGLImageKHR GpuRenderer::create_egl_image(const DmaBufFrame &f)
+{
+    const EGLint attrs[] = {
+        EGL_WIDTH,                      W_,
+        EGL_HEIGHT,                     H_,
+        EGL_LINUX_DRM_FOURCC_EXT,       DRM_FORMAT_NV12,
+        EGL_DMA_BUF_PLANE0_FD_EXT,      f.fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,  f.y_offset,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,   stride_,
+        EGL_DMA_BUF_PLANE1_FD_EXT,      f.fd,
+        EGL_DMA_BUF_PLANE1_OFFSET_EXT,  f.uv_offset,
+        EGL_DMA_BUF_PLANE1_PITCH_EXT,   stride_,
+        EGL_NONE,
+    };
+    return pfn_CreateImage(egl_->dpy, EGL_NO_CONTEXT,
+                           EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
+}
+
+// File mode init — system-memory NV12 path via sampler2D textures.
+bool GpuRenderer::init(const EGLState &egl, int w, int h, int stride)
+{
+    egl_    = &egl;
+    W_      = w;
+    H_      = h;
+    stride_ = stride;
+
+    if (!load_ext_fns()) return false;
+
+    double t0 = now_ms();
+    prog_2d_ = build_program(kVS, kFS_2D);
+    if (!prog_2d_) return false;
+    std::printf("[gpu] shader compile+link : %.1f ms (one-time)\n", now_ms() - t0);
+
+    glUseProgram(prog_2d_);
+    glUniform1i(glGetUniformLocation(prog_2d_, "uTexY"),  0);
+    glUniform1i(glGetUniformLocation(prog_2d_, "uTexUV"), 1);
+
+    // Allocate persistent Y and UV textures (data uploaded each frame).
+    glGenTextures(1, &tex_y_);
+    glBindTexture(GL_TEXTURE_2D, tex_y_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &tex_uv_);
+    glBindTexture(GL_TEXTURE_2D, tex_uv_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenFramebuffers(1,  &fbo_);
+    glGenRenderbuffers(1, &rbo_);
+    glBindRenderbuffer(GL_RENDERBUFFER, rbo_);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, W_, H_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              GL_RENDERBUFFER, rbo_);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "[gpu] FBO incomplete\n";
+        return false;
+    }
+    glViewport(0, 0, W_, H_);
+
+    if (gpu_stats_.available)
+        pfn_GenQueries(1, &timer_query_);
+
+    std::printf("[gpu] renderer ready (file/sysmem mode): %dx%d stride=%d\n", W_, H_, stride_);
+    return true;
+}
+
+bool GpuRenderer::init_dual(const EGLState &egl, int w, int h, int stride)
+{
+    // Build the base single-file setup (FBO, tex_y_, tex_uv_, prog_2d_).
+    if (!init(egl, w, h, stride)) return false;
+
+    double t0 = now_ms();
+    prog_dual_ = build_program(kVS, kFS_DUAL);
+    if (!prog_dual_) return false;
+    std::printf("[gpu] dual shader compile+link : %.1f ms\n", now_ms() - t0);
+
+    glUseProgram(prog_dual_);
+    glUniform1i(glGetUniformLocation(prog_dual_, "uTexY0"),  0);
+    glUniform1i(glGetUniformLocation(prog_dual_, "uTexUV0"), 1);
+    glUniform1i(glGetUniformLocation(prog_dual_, "uTexY1"),  2);
+    glUniform1i(glGetUniformLocation(prog_dual_, "uTexUV1"), 3);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uOverlap"),    0.86f);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uBlendEdge"), 0.45f);
+
+    auto make_tex = [](GLuint &t) {
+        glGenTextures(1, &t);
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
+    make_tex(tex_y2_);
+    make_tex(tex_uv2_);
+
+    std::printf("[gpu] renderer ready (dual file mode): %dx%d\n", W_, H_);
+    return true;
+}
+
 bool GpuRenderer::init(const EGLState &egl,
                        const StreamConfiguration &sc,
                        const std::vector<std::unique_ptr<FrameBuffer>> &buffers)
@@ -207,16 +441,7 @@ bool GpuRenderer::init(const EGLState &egl,
             return false;
         }
 
-        GLuint tex = 0;
-        glGenTextures(1, &tex);
-        glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        pfn_TexImage2DOES(GL_TEXTURE_EXTERNAL_OES, img);
-
-        fd_cache_[fd] = {img, tex};
+        cache_frame(fd, img);
         std::printf("[gpu] cached fd=%-3d → EGLImage+texture\n", fd);
     }
 
@@ -227,23 +452,7 @@ bool GpuRenderer::init(const EGLState &egl,
 
 void GpuRenderer::render_frame(const FrameBuffer *buf)
 {
-    // Collect last frame's GPU time. At 15–30 fps the GPU finishes in ~11 ms;
-    // the next render_frame() arrives 33–67 ms later so the result is ready
-    // without any stall. GL_QUERY_RESULT returns instantly here.
-    if (timer_pending_ && gpu_stats_.available) {
-        GLuint64 ns = 0;
-        pfn_GetQuery64(timer_query_, GL_QUERY_RESULT_EXT, &ns);
-        double ms = (double)ns * 1e-6;
-
-        auto &s = gpu_stats_;
-        if (s.warmup_count < GpuStats::WARMUP_N)
-            s.warmup_ms[s.warmup_count++] = ms;
-        s.sum_ms += ms;
-        if (ms < s.min_ms) s.min_ms = ms;
-        if (ms > s.max_ms) s.max_ms = ms;
-        ++s.frames;
-        timer_pending_ = false;
-    }
+    collect_timer();
 
     int fd = buf->planes()[0].fd.get();
     auto it = fd_cache_.find(fd);
@@ -260,6 +469,77 @@ void GpuRenderer::render_frame(const FrameBuffer *buf)
     if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
 
     glFlush(); // submit to GPU; don't stall CPU
+}
+
+void GpuRenderer::render_frame(const DmaBufFrame &frame)
+{
+    collect_timer();
+
+    if (frame.fd < 0) {
+        // System memory path (file mode).
+        upload_nv12(frame, tex_y_, tex_uv_, 0, 1);
+        glUseProgram(prog_2d_);
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+        glViewport(0, 0, W_, H_);
+        if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+        glFlush();
+        return;
+    }
+
+    // DMA-BUF path (camera mode).
+    auto it = fd_cache_.find(frame.fd);
+    if (it == fd_cache_.end()) {
+        EGLImageKHR img = create_egl_image(frame);
+        if (img == EGL_NO_IMAGE_KHR) {
+            std::cerr << "[gpu] eglCreateImageKHR failed for fd=" << frame.fd
+                      << " (0x" << std::hex << eglGetError() << std::dec << ")\n";
+            return;
+        }
+        cache_frame(frame.fd, img);
+        std::printf("[gpu] cached fd=%-3d → EGLImage+texture (lazy)\n", frame.fd);
+        it = fd_cache_.find(frame.fd);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, it->second.texture);
+
+    if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    glFlush();
+}
+
+void GpuRenderer::set_stitch_overlap(float v)
+{
+    if (!prog_dual_) return;
+    glUseProgram(prog_dual_);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uOverlap"), v);
+}
+
+void GpuRenderer::set_blend_edge(float v)
+{
+    if (!prog_dual_) return;
+    glUseProgram(prog_dual_);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uBlendEdge"), v);
+}
+
+void GpuRenderer::render_frame(const DmaBufFrame &left, const DmaBufFrame &right)
+{
+    collect_timer();
+
+    upload_nv12(left,  tex_y_,  tex_uv_,  0, 1);
+    upload_nv12(right, tex_y2_, tex_uv2_, 2, 3);
+
+    glUseProgram(prog_dual_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glViewport(0, 0, W_, H_);
+
+    if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    glFlush();
 }
 
 bool GpuRenderer::save_snapshot(const char *path)
@@ -322,9 +602,15 @@ void GpuRenderer::cleanup()
     fd_cache_.clear();
 
     if (timer_query_ && pfn_DelQueries) { pfn_DelQueries(1, &timer_query_); timer_query_ = 0; }
-    if (fbo_)  { glDeleteFramebuffers(1,  &fbo_);  fbo_  = 0; }
-    if (rbo_)  { glDeleteRenderbuffers(1, &rbo_);  rbo_  = 0; }
-    if (prog_) { glDeleteProgram(prog_);            prog_ = 0; }
+    if (fbo_)       { glDeleteFramebuffers(1,  &fbo_);       fbo_       = 0; }
+    if (rbo_)       { glDeleteRenderbuffers(1, &rbo_);       rbo_       = 0; }
+    if (prog_)      { glDeleteProgram(prog_);                 prog_      = 0; }
+    if (prog_2d_)   { glDeleteProgram(prog_2d_);              prog_2d_   = 0; }
+    if (prog_dual_) { glDeleteProgram(prog_dual_);            prog_dual_ = 0; }
+    if (tex_y_)     { glDeleteTextures(1, &tex_y_);          tex_y_     = 0; }
+    if (tex_uv_)    { glDeleteTextures(1, &tex_uv_);         tex_uv_    = 0; }
+    if (tex_y2_)    { glDeleteTextures(1, &tex_y2_);         tex_y2_    = 0; }
+    if (tex_uv2_)   { glDeleteTextures(1, &tex_uv2_);        tex_uv2_   = 0; }
 
     egl_ = nullptr;
 }
