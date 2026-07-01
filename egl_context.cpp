@@ -123,21 +123,23 @@ bool check_extensions(const EGLState &egl)
     const char *gl_exts  =
         reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
 
-    struct { const char *name; bool is_egl; } required[] = {
-        { "EGL_EXT_image_dma_buf_import", true  },
-        { "EGL_KHR_image_base",           true  },
-        { "GL_OES_EGL_image",             false },
-        { "GL_OES_EGL_image_external",    false },
+    struct { const char *name; bool is_egl; bool required; } exts[] = {
+        { "EGL_EXT_image_dma_buf_import",    true,  true  },
+        { "EGL_KHR_image_base",              true,  true  },
+        { "GL_OES_EGL_image",                false, true  },
+        { "GL_OES_EGL_image_external",       false, true  },
+        // Optional — enables GPU-side timer queries for render profiling.
+        { "GL_EXT_disjoint_timer_query",     false, false },
     };
 
-    std::cout << "\n[egl] Required extension check:\n";
+    std::cout << "\n[egl] Extension check:\n";
     bool all_ok = true;
-    for (auto &r : required) {
-        const char *pool  = r.is_egl ? egl_exts : gl_exts;
-        bool        found = has_ext(pool, r.name);
-        std::cout << "  " << (found ? "[OK]     " : "[MISSING]")
-                  << " " << r.name << "\n";
-        if (!found) all_ok = false;
+    for (auto &e : exts) {
+        const char *pool  = e.is_egl ? egl_exts : gl_exts;
+        bool        found = has_ext(pool, e.name);
+        const char *tag   = found ? "[OK]      " : (e.required ? "[MISSING] " : "[optional]");
+        std::cout << "  " << tag << " " << e.name << "\n";
+        if (!found && e.required) all_ok = false;
     }
     std::cout << "\n";
     return all_ok;

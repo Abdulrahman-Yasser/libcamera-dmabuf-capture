@@ -27,6 +27,7 @@ add_executable(libcamera-dmabuf-capture
     main.cpp
     egl_context.cpp
     capture_session.cpp
+    gpu_renderer.cpp
     dmabuf_import.cpp
 )
 

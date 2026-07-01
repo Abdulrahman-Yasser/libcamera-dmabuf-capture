@@ -1,4 +1,5 @@
 #include "dmabuf_import.h"
+#include "perf_timer.h"
 
 #include <EGL/eglext.h>
 #include <GLES3/gl3.h>       /* GL_RGBA8, glReadPixels, etc. */
@@ -6,8 +7,19 @@
 #include <drm/drm_fourcc.h>
 #include <png.h>
 
+#include <cstdio>
+#include <cstdlib>           /* getenv, atoi */
 #include <iostream>
 #include <vector>
+
+/* GL_EXT_disjoint_timer_query — available on Mesa V3D (RPi4).
+ * Guards protect against headers that already define these. */
+#ifndef GL_TIME_ELAPSED_EXT
+#define GL_TIME_ELAPSED_EXT 0x88BF
+#endif
+#ifndef GL_QUERY_RESULT_EXT
+#define GL_QUERY_RESULT_EXT 0x8866
+#endif
 
 using namespace libcamera;
 
@@ -16,6 +28,19 @@ using namespace libcamera;
 static PFNEGLCREATEIMAGEKHRPROC            pfn_CreateImage   = nullptr;
 static PFNEGLDESTROYIMAGEKHRPROC           pfn_DestroyImage  = nullptr;
 static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC pfn_TexImage2DOES = nullptr;
+
+// GL_EXT_disjoint_timer_query — optional; gives true GPU execution time.
+typedef void      (*PFNGLGENQUERIESEXTPROC)         (GLsizei, GLuint *);
+typedef void      (*PFNGLDELETEQUERIESEXTPROC)      (GLsizei, const GLuint *);
+typedef void      (*PFNGLBEGINQUERYEXTPROC)         (GLenum, GLuint);
+typedef void      (*PFNGLENDQUERYEXTPROC)           (GLenum);
+typedef void      (*PFNGLGETQUERYOBJECTUI64VEXTPROC)(GLuint, GLenum, GLuint64 *);
+
+static PFNGLGENQUERIESEXTPROC          pfn_GenQueries        = nullptr;
+static PFNGLDELETEQUERIESEXTPROC       pfn_DeleteQueries     = nullptr;
+static PFNGLBEGINQUERYEXTPROC          pfn_BeginQuery        = nullptr;
+static PFNGLENDQUERYEXTPROC            pfn_EndQuery          = nullptr;
+static PFNGLGETQUERYOBJECTUI64VEXTPROC pfn_GetQueryObjectui64v = nullptr;
 
 static bool load_ext_fns()
 {
@@ -29,6 +54,24 @@ static bool load_ext_fns()
         std::cerr << "[dmabuf] failed to resolve EGL/GL extension functions\n";
         return false;
     }
+
+    // Timer query extension — optional; log availability but don't fail.
+    pfn_GenQueries        = reinterpret_cast<PFNGLGENQUERIESEXTPROC>(
+        eglGetProcAddress("glGenQueriesEXT"));
+    pfn_DeleteQueries     = reinterpret_cast<PFNGLDELETEQUERIESEXTPROC>(
+        eglGetProcAddress("glDeleteQueriesEXT"));
+    pfn_BeginQuery        = reinterpret_cast<PFNGLBEGINQUERYEXTPROC>(
+        eglGetProcAddress("glBeginQueryEXT"));
+    pfn_EndQuery          = reinterpret_cast<PFNGLENDQUERYEXTPROC>(
+        eglGetProcAddress("glEndQueryEXT"));
+    pfn_GetQueryObjectui64v = reinterpret_cast<PFNGLGETQUERYOBJECTUI64VEXTPROC>(
+        eglGetProcAddress("glGetQueryObjectui64vEXT"));
+
+    bool timer_ok = pfn_GenQueries && pfn_DeleteQueries &&
+                    pfn_BeginQuery  && pfn_EndQuery && pfn_GetQueryObjectui64v;
+    std::cerr << "[dmabuf] GL_EXT_disjoint_timer_query: "
+              << (timer_ok ? "available" : "NOT available (will use wall-clock)") << "\n";
+
     return true;
 }
 
@@ -75,6 +118,7 @@ static GLuint build_program(const char *vs_src, const char *fs_src)
     }
     return prog;
 }
+
 
 // Save RGBA pixels as PNG.
 // glReadPixels returns rows bottom-to-top; PNG expects top-to-bottom,
@@ -136,6 +180,7 @@ bool import_and_save_png(const EGLState            &egl,
               << " y_off=" << planes[0].offset
               << " uv_off=" << planes[1].offset
               << " pitch=" << stride << " " << W << "x" << H << ")\n";
+    double t_egl_import_start = now_ms();
 
     const EGLint attrs[] = {
         EGL_WIDTH,                      W,
@@ -157,6 +202,11 @@ bool import_and_save_png(const EGLState            &egl,
                   << std::hex << eglGetError() << std::dec << ")\n";
         return false;
     }
+    double t_egl_import_end = now_ms();
+    std::printf("[perf] EGL DMA-BUF import : %6.3f ms%s\n",
+                t_egl_import_end - t_egl_import_start,
+                (t_egl_import_end - t_egl_import_start > 10.0)
+                    ? "  <-- WARNING: >10ms may indicate sysmem copy!" : "");
     std::cerr << "[dmabuf] step 2/7  EGLImage OK\n";
 
     // ── 2. Bind NV12 EGLImage as GL_TEXTURE_EXTERNAL_OES ─────────────────
@@ -178,6 +228,7 @@ bool import_and_save_png(const EGLState            &egl,
     //           texture() returns RGB directly thanks to Mesa V3D hardware
     //           NV12→RGB conversion on the sampler path.
     std::cerr << "[dmabuf] step 4/7  compiling shaders\n";
+    double t_shader_start = now_ms();
 
     static const char kVS[] = R"glsl(
 #version 300 es
@@ -231,6 +282,8 @@ void main() {
         pfn_DestroyImage(egl.dpy, image);
         return false;
     }
+    std::printf("[perf] Shader compile+link : %6.3f ms  (one-time JIT cost)\n",
+                now_ms() - t_shader_start);
     std::cerr << "[dmabuf] step 4/7  shaders OK\n";
 
     // ── 4. FBO with GL_RGBA8 renderbuffer ────────────────────────────────
@@ -262,35 +315,99 @@ void main() {
     glUniform1i(glGetUniformLocation(prog, "uTexture"), 0);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
+
+    // CPU wall-clock render time (glFinish blocks until GPU done).
+    double t_render_start = now_ms();
     glDrawArrays(GL_TRIANGLES, 0, 3);
     glFinish();
+    double t_render_wall = now_ms() - t_render_start;
+    std::printf("[perf] GPU render (wall-clock): %6.3f ms\n", t_render_wall);
 
-    // ── 6. Read back pixels — DEBUG: remove in Stage 4 ───────────────────
-    // glReadPixels is a CPU stall that defeats zero-copy. Only here to
-    // verify shader output is visually correct before Stage 4 wiring.
-    std::vector<uint8_t> pixels((size_t)W * (size_t)H * 4);
-    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data()); // DEBUG: remove in Stage 4
+    // GPU-side timer query — gives true GPU execution time, not CPU scheduling.
+    // Only available if GL_EXT_disjoint_timer_query is supported.
+    if (pfn_GenQueries) {
+        GLuint qid = 0;
+        pfn_GenQueries(1, &qid);
+        pfn_BeginQuery(GL_TIME_ELAPSED_EXT, qid);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        pfn_EndQuery(GL_TIME_ELAPSED_EXT);
+        glFinish();
+        GLuint64 ns = 0;
+        pfn_GetQueryObjectui64v(qid, GL_QUERY_RESULT_EXT, &ns);
+        pfn_DeleteQueries(1, &qid);
+        std::printf("[perf] GPU render (timer query): %6.3f ms\n", ns * 1e-6);
+    }
 
-    GLenum gl_err = glGetError();
-    if (gl_err != GL_NO_ERROR)
-        std::cerr << "[dmabuf] GL error after glReadPixels: 0x"
-                  << std::hex << gl_err << std::dec << "\n";
-    std::cerr << "[dmabuf] step 6/7  render + readback OK\n";
+    // Benchmark loop: render N frames and report avg/min/max throughput.
+    // Controlled by env var BENCH_FRAMES (default 0 = skip).
+    const char *bench_env = std::getenv("BENCH_FRAMES");
+    int bench_n = bench_env ? std::atoi(bench_env) : 0;
+    if (bench_n > 0) {
+        // One warm-up render so the GPU cache and driver state are hot.
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glFinish();
 
-    // ── 7. Cleanup GL resources ───────────────────────────────────────────
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glDeleteFramebuffers(1,  &fbo);
-    glDeleteRenderbuffers(1, &rbo);
-    glDeleteProgram(prog);
-    glDeleteTextures(1, &tex);
-    pfn_DestroyImage(egl.dpy, image);
+        double t_min = 1e9, t_max = 0.0, t_sum = 0.0;
+        for (int i = 0; i < bench_n; ++i) {
+            double t0 = now_ms();
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            glFinish();
+            double dt = now_ms() - t0;
+            t_sum += dt;
+            if (dt < t_min) t_min = dt;
+            if (dt > t_max) t_max = dt;
+        }
+        double avg = t_sum / bench_n;
+        std::printf("\n[bench] %d render iterations:\n"
+                    "        avg = %6.3f ms  (%4.0f fps ceiling)\n"
+                    "        min = %6.3f ms\n"
+                    "        max = %6.3f ms\n\n",
+                    bench_n, avg, 1000.0 / avg, t_min, t_max);
+    }
 
-    // ── 8. Save PNG ───────────────────────────────────────────────────────
-    std::cerr << "[dmabuf] step 7/7  saving PNG\n";
-    bool ok = save_png("/tmp/frame.png", pixels.data(), W, H);
-    if (ok)
-        std::cout << "Saved /tmp/frame.png — scp to laptop to verify\n";
-    else
-        std::cerr << "[dmabuf] save_png failed\n";
+    // ── 6. Read back + save PNG — set SAVE_PNG=1 to enable ───────────────
+    // Must happen BEFORE cleanup while the FBO is still bound.
+    // glReadPixels is a CPU stall that defeats zero-copy; skipped by default.
+    bool ok = true;
+    if (std::getenv("SAVE_PNG")) {
+        std::vector<uint8_t> pixels((size_t)W * (size_t)H * 4);
+        double t_readback_start = now_ms();
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        std::printf("[perf] glReadPixels readback : %6.3f ms  (~%.1f MB CPU stall)\n",
+                    now_ms() - t_readback_start,
+                    (double)W * H * 4 / (1024.0 * 1024.0));
+
+        GLenum gl_err = glGetError();
+        if (gl_err != GL_NO_ERROR)
+            std::cerr << "[dmabuf] GL error after glReadPixels: 0x"
+                      << std::hex << gl_err << std::dec << "\n";
+
+        // ── 7. Cleanup GL resources ───────────────────────────────────────
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1,  &fbo);
+        glDeleteRenderbuffers(1, &rbo);
+        glDeleteProgram(prog);
+        glDeleteTextures(1, &tex);
+        pfn_DestroyImage(egl.dpy, image);
+
+        std::cerr << "[dmabuf] step 7/7  saving PNG\n";
+        double t_png_start = now_ms();
+        ok = save_png("/tmp/frame.png", pixels.data(), W, H);
+        std::printf("[perf] PNG encode+write    : %6.3f ms\n", now_ms() - t_png_start);
+        if (ok)
+            std::cout << "Saved /tmp/frame.png — scp to laptop to verify\n";
+        else
+            std::cerr << "[dmabuf] save_png failed\n";
+    } else {
+        // ── 7. Cleanup GL resources ───────────────────────────────────────
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glDeleteFramebuffers(1,  &fbo);
+        glDeleteRenderbuffers(1, &rbo);
+        glDeleteProgram(prog);
+        glDeleteTextures(1, &tex);
+        pfn_DestroyImage(egl.dpy, image);
+
+        std::cout << "[dmabuf] skipping readback+PNG (run with SAVE_PNG=1 to enable)\n";
+    }
     return ok;
 }

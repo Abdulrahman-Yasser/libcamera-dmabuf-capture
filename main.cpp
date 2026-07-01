@@ -1,54 +1,86 @@
 #include "egl_context.h"
 #include "capture_session.h"
-#include "dmabuf_import.h"
+#include "gpu_renderer.h"
+#include "perf_timer.h"
 
 #include <libcamera/libcamera.h>
 
+#include <csignal>
+#include <cstdio>
 #include <iostream>
 #include <memory>
+#include <vector>
+
+#include <cfloat>
+
+#include <fcntl.h>
+#include <termios.h>
+#include <unistd.h>
 
 using namespace libcamera;
 
+static volatile sig_atomic_t g_running = 1;
+
+// Read process RSS (Resident Set Size) from /proc/self/status — cheap, no syscall overhead.
+static long read_rss_kb()
+{
+    FILE *f = std::fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[128];
+    long kb = -1;
+    while (std::fgets(line, sizeof(line), f))
+        if (std::sscanf(line, "VmRSS: %ld kB", &kb) == 1) break;
+    std::fclose(f);
+    return kb;
+}
+
+// Put terminal in raw mode so keypresses register without pressing Enter.
+static struct termios g_old_tio;
+static void enable_raw_stdin()
+{
+    tcgetattr(STDIN_FILENO, &g_old_tio);
+    struct termios raw = g_old_tio;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
+}
+static void restore_stdin()
+{
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_old_tio);
+}
+
 int main()
 {
+    std::signal(SIGINT,  [](int){ g_running = 0; });
+    std::signal(SIGTERM, [](int){ g_running = 0; });
+
     /* ---- EGL/GBM headless context ---- */
     EGLState egl;
     if (!setup_egl(egl)) {
-        teardown_egl(egl);
-        return 1;
+        teardown_egl(egl); return 1;
     }
     if (!check_extensions(egl)) {
-        std::cerr << "[egl] one or more required extensions missing — "
-                     "cannot proceed to DMA-BUF import\n";
-        teardown_egl(egl);
-        return 1;
+        std::cerr << "[egl] required extensions missing\n";
+        teardown_egl(egl); return 1;
     }
     std::cout << "[egl] context ready\n\n";
 
-    /* ---- libcamera capture ---- */
+    /* ---- Camera init ---- */
     auto cm = std::make_unique<CameraManager>();
-    int r = cm->start();
-    if (r) {
-        std::cerr << "[capture] CameraManager::start failed: " << r << "\n";
-        teardown_egl(egl);
-        return 1;
+    if (cm->start()) {
+        std::cerr << "[capture] CameraManager::start failed\n";
+        teardown_egl(egl); return 1;
     }
     if (cm->cameras().empty()) {
         std::cerr << "[capture] no cameras detected\n";
-        cm->stop();
-        teardown_egl(egl);
-        return 1;
+        cm->stop(); teardown_egl(egl); return 1;
     }
 
     std::shared_ptr<Camera> camera = cm->cameras()[0];
     std::cout << "[capture] camera: " << camera->id() << "\n";
 
-    r = camera->acquire();
-    if (r) {
-        std::cerr << "[capture] Camera::acquire failed: " << r << "\n";
-        cm->stop();
-        teardown_egl(egl);
-        return 1;
+    if (camera->acquire()) {
+        cm->stop(); teardown_egl(egl); return 1;
     }
 
     auto config = camera->generateConfiguration({StreamRole::Viewfinder});
@@ -60,73 +92,193 @@ int main()
     sc.size        = {1640, 1232};
     sc.pixelFormat = formats::NV12;
 
-    CameraConfiguration::Status st = config->validate();
-    if (st == CameraConfiguration::Invalid) {
-        std::cout << "[capture] NV12 not supported, trying YUYV\n";
-        sc.pixelFormat = formats::YUYV;
-        st = config->validate();
-    }
-    if (st == CameraConfiguration::Invalid) {
+    if (config->validate() == CameraConfiguration::Invalid) {
         std::cerr << "[capture] no supported format\n";
         camera->release(); cm->stop(); teardown_egl(egl); return 1;
     }
-    if (st == CameraConfiguration::Adjusted)
+    if (config->validate() == CameraConfiguration::Adjusted)
         std::cout << "[capture] config adjusted: " << sc.toString() << "\n";
 
-    r = camera->configure(config.get());
-    if (r) {
-        std::cerr << "[capture] Camera::configure failed: " << r << "\n";
+    if (camera->configure(config.get())) {
+        std::cerr << "[capture] configure failed\n";
         camera->release(); cm->stop(); teardown_egl(egl); return 1;
     }
 
+    /* ---- Buffer pool: one request per buffer ---- */
     Stream *stream = sc.stream();
     FrameBufferAllocator alloc(camera);
     if (alloc.allocate(stream) < 0) {
         camera->release(); cm->stop(); teardown_egl(egl); return 1;
     }
 
-    auto request = camera->createRequest();
-    if (!request ||
-        request->addBuffer(stream, alloc.buffers(stream)[0].get())) {
+    std::vector<std::unique_ptr<Request>> requests;
+    for (auto &buf : alloc.buffers(stream)) {
+        auto req = camera->createRequest();
+        if (!req || req->addBuffer(stream, buf.get())) {
+            camera->release(); cm->stop(); teardown_egl(egl); return 1;
+        }
+        requests.push_back(std::move(req));
+    }
+    std::printf("[capture] %zu buffer(s) allocated\n", requests.size());
+
+    /* ---- GPU renderer: compile shader + FBO + EGLImage cache ---- */
+    GpuRenderer renderer;
+    if (!renderer.init(egl, sc, alloc.buffers(stream))) {
         camera->release(); cm->stop(); teardown_egl(egl); return 1;
     }
 
+    /* ---- Camera start + AE/AWB warmup ---- */
     CaptureSession session(sc, camera.get());
-    camera->requestCompleted.connect(&session,
-                                     &CaptureSession::requestCompleted);
+    camera->requestCompleted.connect(&session, &CaptureSession::requestCompleted);
     std::cout << "[capture] warming up AE/AWB ("
               << CaptureSession::WARMUP_FRAMES << " frames)...\n";
 
-    r = camera->start();
-    if (r) {
+    if (camera->start()) {
         camera->release(); cm->stop(); teardown_egl(egl); return 1;
     }
-    r = camera->queueRequest(request.get());
-    if (r) {
-        camera->stop(); camera->release();
-        cm->stop(); teardown_egl(egl); return 1;
+    for (auto &req : requests)
+        camera->queueRequest(req.get());
+
+    session.waitWarmupDone();
+
+    /* ---- Continuous render loop ---- */
+    enable_raw_stdin();
+    std::cout << "[loop] running — press 's' to save snapshot, Ctrl+C to stop\n";
+
+    double   t_fps       = now_ms();
+    double   t_prev      = t_fps;
+    uint64_t fps_frames  = 0;
+    uint64_t total_frames = 0;
+
+    // Wall-clock frame time stats (camera-to-camera interval).
+    double wall_sum_ms = 0, wall_min_ms = DBL_MAX, wall_max_ms = 0;
+    // CPU time spent inside render_frame() — should be near 0 (just submits to GPU).
+    double cpu_render_sum_ms = 0;
+
+    while (g_running) {
+        auto [buf, req] = session.nextFrame();
+        if (!buf) break;
+
+        double t_now        = now_ms();
+        double wall_ms      = t_now - t_prev;
+        t_prev              = t_now;
+
+        double t_r0         = now_ms();
+        renderer.render_frame(buf);
+        double cpu_render_ms = now_ms() - t_r0;
+
+        // Non-blocking keyboard check — cost is near zero when no key pressed.
+        char key = 0;
+        if (read(STDIN_FILENO, &key, 1) == 1 && (key == 's' || key == 'S')) {
+            static int snap_idx = 0;
+            char path[64];
+            std::snprintf(path, sizeof(path), "/tmp/snapshot_%03d.png", snap_idx++);
+            renderer.save_snapshot(path);
+        }
+
+        req->reuse(Request::ReuseBuffers);
+        camera->queueRequest(req);
+
+        ++fps_frames;
+        ++total_frames;
+
+        // Accumulate wall-clock stats (skip first frame — wall_ms is garbage).
+        if (total_frames > 1) {
+            wall_sum_ms     += wall_ms;
+            if (wall_ms < wall_min_ms) wall_min_ms = wall_ms;
+            if (wall_ms > wall_max_ms) wall_max_ms = wall_ms;
+            cpu_render_sum_ms += cpu_render_ms;
+        }
+
+        // Print FPS + CPU render time + RSS once per second.
+        double t_tick = now_ms();
+        if (t_tick - t_fps >= 1000.0) {
+            double fps     = fps_frames * 1000.0 / (t_tick - t_fps);
+            long   rss_kb  = read_rss_kb();
+            double cpu_avg = total_frames > 1
+                             ? cpu_render_sum_ms / (total_frames - 1) : 0.0;
+            std::printf("[perf] %4.1f fps | render_cpu avg %.3f ms | RSS %ld kB"
+                        " | frames %llu\n",
+                        fps, cpu_avg, rss_kb,
+                        (unsigned long long)total_frames);
+            t_fps      = t_tick;
+            fps_frames = 0;
+        }
     }
 
-    session.waitDone();
+    std::printf("\n[loop] stopped after %llu frames\n",
+                (unsigned long long)total_frames);
 
-    /* ---- Stage 3: DMA-BUF → EGL → NV12→RGB shader → PNG ---- */
-    if (!import_and_save_png(egl, session.capturedBuffer(), sc)) {
-        std::cerr << "[dmabuf] PNG export failed\n";
-        camera->stop();
-        alloc.free(stream);
-        camera->release();
-        cm->stop();
-        teardown_egl(egl);
-        return 1;
+    // ── Full performance report ───────────────────────────────────────────
+    uint64_t n = total_frames > 1 ? total_frames - 1 : 1;
+    double   avg_wall   = wall_sum_ms   / n;
+    double   avg_cpu    = cpu_render_sum_ms / n;
+    double   actual_fps = avg_wall > 0 ? 1000.0 / avg_wall : 0.0;
+
+    // Theoretical memory bandwidth per frame:
+    //   Read:  NV12 = W*H*1.5 bytes (Y plane + UV half-res)
+    //   Write: RGBA = W*H*4   bytes (FBO color attachment)
+    int W = sc.size.width, H = sc.size.height;
+    double nv12_mb   = (double)W * H * 1.5 / 1048576.0;
+    double rgba_mb   = (double)W * H * 4.0 / 1048576.0;
+    double bw_mbps   = (nv12_mb + rgba_mb) * actual_fps;
+
+    const auto &gs   = renderer.gpu_stats();
+    double gpu_avg   = gs.frames > 0 ? gs.sum_ms / gs.frames : 0.0;
+    double gpu_ceil  = gpu_avg  > 0  ? 1000.0   / gpu_avg    : 0.0;
+
+    std::printf("\n");
+    std::printf("=== PERFORMANCE REPORT ================================\n");
+    std::printf("  Resolution      : %dx%d\n", W, H);
+    std::printf("  Frames captured : %llu\n", (unsigned long long)total_frames);
+    std::printf("\n");
+    std::printf("-- Profile (wall-clock, camera-to-camera) -------------\n");
+    std::printf("  avg frame time  : %6.2f ms  (%4.1f fps actual)\n", avg_wall, actual_fps);
+    std::printf("  min frame time  : %6.2f ms\n", wall_min_ms < DBL_MAX ? wall_min_ms : 0.0);
+    std::printf("  max frame time  : %6.2f ms  (jitter: +%.2f ms)\n",
+                wall_max_ms, wall_max_ms - (wall_min_ms < DBL_MAX ? wall_min_ms : 0.0));
+    std::printf("\n");
+    std::printf("-- CPU load (render_frame() call overhead) ------------\n");
+    std::printf("  avg CPU/frame   : %6.3f ms  (rest is GPU + camera wait)\n", avg_cpu);
+    std::printf("  CPU busy ratio  : %.1f%%  of frame time\n",
+                avg_wall > 0 ? avg_cpu / avg_wall * 100.0 : 0.0);
+    std::printf("\n");
+    if (gs.available) {
+        std::printf("-- GPU utilization (GL_EXT_disjoint_timer_query) ------\n");
+        std::printf("  avg GPU time    : %6.3f ms  (ceiling: %.0f fps)\n", gpu_avg, gpu_ceil);
+        std::printf("  min GPU time    : %6.3f ms\n", gs.min_ms < DBL_MAX ? gs.min_ms : 0.0);
+        std::printf("  max GPU time    : %6.3f ms\n", gs.max_ms);
+        std::printf("  GPU utilization : %.1f%%  of frame time\n",
+                    avg_wall > 0 ? gpu_avg / avg_wall * 100.0 : 0.0);
+        std::printf("  frames measured : %llu\n", (unsigned long long)gs.frames);
+        std::printf("\n");
+        std::printf("-- GPU cache preload (first %d frames after warmup) ---\n",
+                    GpuRenderer::GpuStats::WARMUP_N);
+        for (int i = 0; i < gs.warmup_count; ++i)
+            std::printf("  frame %2d        : %6.3f ms\n", i + 1, gs.warmup_ms[i]);
+        std::printf("\n");
     }
+    std::printf("-- Memory bandwidth (theoretical) ----------------------\n");
+    std::printf("  NV12 read/frame : %5.2f MB  (%.0f*%.0f * 1.5)\n",
+                nv12_mb, (double)W, (double)H);
+    std::printf("  RGBA write/frame: %5.2f MB  (%.0f*%.0f * 4)\n",
+                rgba_mb, (double)W, (double)H);
+    std::printf("  Total bandwidth : %5.1f MB/s  @ %.1f fps\n", bw_mbps, actual_fps);
+    std::printf("\n");
+    std::printf("-- Sysmem (RSS at exit) --------------------------------\n");
+    std::printf("  RSS             : %ld kB\n", read_rss_kb());
+    std::printf("=======================================================\n");
 
     /* ---- Cleanup ---- */
+    restore_stdin();
+    session.stop();
     camera->stop();
+    renderer.cleanup();
     alloc.free(stream);
     camera->release();
     cm->stop();
-
     teardown_egl(egl);
+
     std::cout << "[exit] clean\n";
     return 0;
 }
