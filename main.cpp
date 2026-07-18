@@ -3,12 +3,14 @@
 #include "gpu_renderer.h"
 #include "file_source.h"
 #include "perf_timer.h"
+#include "ipm.h"
 
 #include <libcamera/libcamera.h>
 
 #include <algorithm>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -53,7 +55,19 @@ static void restore_stdin()
 
 // ── Dual file mode ────────────────────────────────────────────────────────────
 
-static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &egl)
+// Inverse-perspective-mapping parameters (see ipm.h). Both cameras share
+// everything except cam_x, which is ∓baseline/2.
+struct IpmParams {
+    double baseline = 0.40; // meters between the two cameras along X
+    double cam_h    = 1.2;  // camera height above the ground, meters
+    double pitch    = -30.0; // degrees; negative = looking down
+    double yaw      = 0.0;   // degrees, rotation about vertical axis
+    double cam_y    = 0.0;   // camera forward offset from world origin, meters
+    double px_per_m = 100.0; // BEV ground-sampling density
+};
+
+static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &egl,
+                              const IpmParams &ipm_in)
 {
     FileSource lsrc, rsrc;
     if (!lsrc.open(lpath))  return 1;
@@ -67,12 +81,43 @@ static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &eg
     GpuRenderer renderer;
     if (!renderer.init_dual(egl, lf.width, lf.height, lf.stride)) return 1;
 
+    // Mutable working copy — runtime keys below adjust this and rebuild.
+    IpmParams ipm = ipm_in;
+
+    // Rebuilds H_left/H_right from the current `ipm` values and re-uploads
+    // them. CPU cost is negligible (a handful of 3x3/4x4 multiplies) but
+    // still only runs on demand — never per rendered frame.
+    auto rebuild_ipm = [&](const char *changed) {
+        mat3 K  = build_intrinsics(lf.width, lf.height);
+        mat3 HL = ground_to_image_H(-ipm.baseline / 2, ipm.cam_y, ipm.cam_h,
+                                    ipm.pitch, ipm.yaw, K,
+                                    lf.width, lf.height, ipm.px_per_m,
+                                    lf.width, lf.height);
+        mat3 HR = ground_to_image_H( ipm.baseline / 2, ipm.cam_y, ipm.cam_h,
+                                    ipm.pitch, ipm.yaw, K,
+                                    lf.width, lf.height, ipm.px_per_m,
+                                    lf.width, lf.height);
+        float HLf[9], HRf[9];
+        HL.to_floats(HLf);
+        HR.to_floats(HRf);
+        renderer.set_ipm(HLf, HRf);
+        renderer.set_px_per_m((float)ipm.px_per_m);
+        std::printf("[ipm] %-10s baseline=%.2fm h=%.2fm pitch=%.1fdeg yaw=%.1fdeg "
+                    "cam_y=%.2fm px_per_m=%.1f\n",
+                    changed, ipm.baseline, ipm.cam_h, ipm.pitch, ipm.yaw,
+                    ipm.cam_y, ipm.px_per_m);
+    };
+
+    rebuild_ipm("init");
+
     enable_raw_stdin();
-    float overlap    = 0.86f;
+    float overlap    = 0.40f; // meters, blend half-width around baseline midline
     float blend_edge = 0.45f;
-    std::printf("[stitch] overlap=%.2f edge=%.2f  "
-                "+/-=overlap  [/]=sharpness  s=snapshot  Ctrl+C=stop\n",
-                overlap, blend_edge);
+    std::printf("[stitch] overlap(m)=%.2f edge=%.2f\n", overlap, blend_edge);
+    std::printf(
+        "[keys] s=snapshot  +/-=overlap  [/]=sharpness  c=sanity-check\n"
+        "       H/h=height+-  P/p=pitch+-  Y/y=yaw+-  B/b=baseline+-  "
+        "G/g=cam_y+-  M/m=px_per_m+-  Ctrl+C=stop\n");
 
     uint64_t total_frames = 0;
 
@@ -88,21 +133,69 @@ static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &eg
                 std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
                 renderer.save_snapshot(snap_path);
             } else if (key == '+' || key == '=') {
-                overlap = std::min(overlap + 0.01f, 0.95f);
+                overlap = std::min(overlap + 0.05f, 3.0f);
                 renderer.set_stitch_overlap(overlap);
-                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+                std::printf("[stitch] overlap(m)=%.2f edge=%.2f\n", overlap, blend_edge);
             } else if (key == '-') {
-                overlap = std::max(overlap - 0.01f, 0.05f);
+                overlap = std::max(overlap - 0.05f, 0.05f);
                 renderer.set_stitch_overlap(overlap);
-                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+                std::printf("[stitch] overlap(m)=%.2f edge=%.2f\n", overlap, blend_edge);
             } else if (key == ']') {
                 blend_edge = std::min(blend_edge + 0.01f, 0.49f);
                 renderer.set_blend_edge(blend_edge);
-                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+                std::printf("[stitch] overlap(m)=%.2f edge=%.2f\n", overlap, blend_edge);
             } else if (key == '[') {
                 blend_edge = std::max(blend_edge - 0.01f, 0.0f);
                 renderer.set_blend_edge(blend_edge);
-                std::printf("[stitch] overlap=%.2f edge=%.2f\n", overlap, blend_edge);
+                std::printf("[stitch] overlap(m)=%.2f edge=%.2f\n", overlap, blend_edge);
+            } else if (key == 'c') {
+                mat3 K  = build_intrinsics(lf.width, lf.height);
+                mat3 HL = ground_to_image_H(-ipm.baseline / 2, ipm.cam_y, ipm.cam_h,
+                                            ipm.pitch, ipm.yaw, K,
+                                            lf.width, lf.height, ipm.px_per_m,
+                                            lf.width, lf.height);
+                mat3 HR = ground_to_image_H( ipm.baseline / 2, ipm.cam_y, ipm.cam_h,
+                                            ipm.pitch, ipm.yaw, K,
+                                            lf.width, lf.height, ipm.px_per_m,
+                                            lf.width, lf.height);
+                ipm_debug_check(HL, lf.width, lf.height, "left");
+                ipm_debug_check(HR, lf.width, lf.height, "right");
+            } else if (key == 'H') {
+                ipm.cam_h = std::min(ipm.cam_h + 0.05, 3.0);
+                rebuild_ipm("height+");
+            } else if (key == 'h') {
+                ipm.cam_h = std::max(ipm.cam_h - 0.05, 0.2);
+                rebuild_ipm("height-");
+            } else if (key == 'P') {
+                ipm.pitch = std::min(ipm.pitch + 1.0, -1.0);
+                rebuild_ipm("pitch+");
+            } else if (key == 'p') {
+                ipm.pitch = std::max(ipm.pitch - 1.0, -89.0);
+                rebuild_ipm("pitch-");
+            } else if (key == 'Y') {
+                ipm.yaw = std::min(ipm.yaw + 1.0, 90.0);
+                rebuild_ipm("yaw+");
+            } else if (key == 'y') {
+                ipm.yaw = std::max(ipm.yaw - 1.0, -90.0);
+                rebuild_ipm("yaw-");
+            } else if (key == 'B') {
+                ipm.baseline = std::min(ipm.baseline + 0.02, 2.0);
+                rebuild_ipm("baseline+");
+            } else if (key == 'b') {
+                ipm.baseline = std::max(ipm.baseline - 0.02, 0.05);
+                rebuild_ipm("baseline-");
+            } else if (key == 'G') {
+                ipm.cam_y = std::min(ipm.cam_y + 0.05, 5.0);
+                rebuild_ipm("cam_y+");
+            } else if (key == 'g') {
+                ipm.cam_y = std::max(ipm.cam_y - 0.05, -5.0);
+                rebuild_ipm("cam_y-");
+            } else if (key == 'M') {
+                ipm.px_per_m = std::min(ipm.px_per_m + 5.0, 500.0);
+                rebuild_ipm("px_per_m+");
+            } else if (key == 'm') {
+                ipm.px_per_m = std::max(ipm.px_per_m - 5.0, 10.0);
+                rebuild_ipm("px_per_m-");
             }
         }
 
@@ -173,11 +266,18 @@ int main(int argc, char *argv[])
     const char *file_path  = nullptr;
     const char *file_left  = nullptr;
     const char *file_right = nullptr;
+    IpmParams   ipm;
     for (int i = 1; i < argc - 1; ++i) {
         std::string a = argv[i];
-        if (a == "--file")        file_path  = argv[i + 1];
+        if (a == "--file")            file_path  = argv[i + 1];
         else if (a == "--file-left")  file_left  = argv[i + 1];
         else if (a == "--file-right") file_right = argv[i + 1];
+        else if (a == "--baseline")   ipm.baseline = std::atof(argv[i + 1]);
+        else if (a == "--h")          ipm.cam_h    = std::atof(argv[i + 1]);
+        else if (a == "--pitch")      ipm.pitch    = std::atof(argv[i + 1]);
+        else if (a == "--yaw")        ipm.yaw      = std::atof(argv[i + 1]);
+        else if (a == "--cam-y")      ipm.cam_y    = std::atof(argv[i + 1]);
+        else if (a == "--px-per-m")   ipm.px_per_m = std::atof(argv[i + 1]);
     }
 
     /* ---- EGL/GBM headless context ---- */
@@ -192,7 +292,7 @@ int main(int argc, char *argv[])
     std::cout << "[egl] context ready\n\n";
 
     if (file_left && file_right) {
-        int rc = run_dual_file_mode(file_left, file_right, egl);
+        int rc = run_dual_file_mode(file_left, file_right, egl, ipm);
         teardown_egl(egl);
         return rc;
     }

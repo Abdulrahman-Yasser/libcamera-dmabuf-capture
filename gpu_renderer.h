@@ -48,11 +48,20 @@ public:
     void render_frame(const DmaBufFrame &frame);
     void render_frame(const DmaBufFrame &left, const DmaBufFrame &right);
 
-    // Adjust the seam-stitch blend zone width at runtime (dual mode only).
-    // fraction: 0 = no overlap (hard cut), 1 = full blend (both cameras everywhere).
-    void set_stitch_overlap(float fraction);
+    // Adjust the seam-stitch blend zone half-width, in meters, centered on
+    // the baseline midline (world X=0) at runtime (dual mode only).
+    void set_stitch_overlap(float half_width_m);
     // Controls crossover sharpness: 0=gradual, 0.49=near-instant cut.
     void set_blend_edge(float edge);
+
+    // Uploads the per-camera BEV-pixel -> camera-image homographies built by
+    // ground_to_image_H() (see ipm.h). Column-major float[9], dual mode only.
+    void set_ipm(const float H_left[9], const float H_right[9]);
+    // BEV ground-sampling density, pixels per meter. This only updates the
+    // GPU-side uniform for readback/debug -- the actual geometry change
+    // requires rebuilding H_left/H_right on the CPU and calling set_ipm()
+    // again, since px_per_m is baked into those matrices.
+    void set_px_per_m(float px_per_m);
 
     bool save_snapshot(const char *path);
 

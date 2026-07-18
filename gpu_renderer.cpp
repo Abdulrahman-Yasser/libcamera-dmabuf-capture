@@ -32,12 +32,11 @@ void main() {
 }
 )glsl";
 
-// Seam-stitch shader.
-// uOverlap: fraction of each camera image that overlaps [0..1].
-// Maps output x -> scene_x in [0, 2-overlap]:
-//   left  camera covers scene_x [0,        1]        → cam_u = scene_x
-//   right camera covers scene_x [1-overlap, 2-overlap] → cam_u = scene_x-(1-overlap)
-// Smoothstep blend in the overlap zone.
+// IPM bird's-eye-view stitch shader.
+// Per-fragment backward warp: each fragment IS a point on the flat-ground
+// BEV output plane. uH_L/uH_R (built by ground_to_image_H(), see ipm.h) map
+// that BEV pixel directly to each camera's normalized image coordinate.
+// Smoothstep blend where both cameras cover the same ground point.
 static const char kFS_DUAL[] = R"glsl(
 #version 300 es
 precision mediump float;
@@ -45,13 +44,31 @@ uniform sampler2D uTexY0;
 uniform sampler2D uTexUV0;
 uniform sampler2D uTexY1;
 uniform sampler2D uTexUV1;
+
+// BEV-pixel -> camera-image homography, column-major, pre-normalized to
+// [0,1] (see ground_to_image_H() in ipm.cpp). uv = (H*p).xy / (H*p).z.
+uniform mat3 uH_L;
+uniform mat3 uH_R;
+
+// BEV canvas size in pixels (matches the FBO/render size; set once at
+// init_dual, not runtime-tunable).
+uniform float uBevWidth;
+uniform float uBevHeight;
+
+// BEV ground-sampling density, pixels per meter. This is already baked into
+// uH_L/uH_R; kept as a uniform only so the blend math below (which needs to
+// recover world-space X from gl_FragCoord) can stay in sync without a
+// separate constant.
+uniform float uPxPerM;
+
+// Blend half-width, in meters, of the seam transition centered on the
+// baseline midline (world X=0) — the two cameras are mounted symmetrically
+// about it, so that's the natural blend center.
 uniform float uOverlap;
 // Controls sharpness of the crossover within the blend zone.
 // 0.0 = full gradual blend, 0.49 = nearly instant cut.
-// At 0.45: left 45% of blend zone = pure left cam, middle 10% = transition,
-//          right 45% = pure right cam. Minimises parallax ghosting.
 uniform float uBlendEdge;
-in  vec2 vTexCoord;
+
 out vec4 fragColor;
 
 vec3 nv12_to_rgb(sampler2D sY, sampler2D sUV, vec2 uv) {
@@ -64,23 +81,45 @@ vec3 nv12_to_rgb(sampler2D sY, sampler2D sUV, vec2 uv) {
 }
 
 void main() {
-    vec2  uv      = vec2(vTexCoord.x, 1.0 - vTexCoord.y);
-    float scene_x = uv.x * (2.0 - uOverlap);
+    // This fragment IS a point on the BEV output plane. gl_FragCoord.y is
+    // GL's bottom-left-origin window coordinate, but ground_to_image_H()'s
+    // M matrix was built assuming top-origin "py" (py=0 = far/top row, like
+    // a normal image) — flip it here to match.
+    vec3 p = vec3(gl_FragCoord.x, uBevHeight - gl_FragCoord.y, 1.0);
 
-    vec2 uv_L = vec2(scene_x,                    uv.y);
-    vec2 uv_R = vec2(scene_x - (1.0 - uOverlap), uv.y);
+    // Project into each camera.
+    vec3 sL = uH_L * p;
+    vec3 sR = uH_R * p;
+    vec2 uvL = sL.xy / sL.z;      // perspective divide
+    vec2 uvR = sR.xy / sR.z;
+
+    // Validity: inside [0,1] AND in front of the camera (z acts as depth).
+    bool okL = sL.z > 0.0 && all(greaterThanEqual(uvL, vec2(0.0)))
+                          && all(lessThanEqual(uvL, vec2(1.0)));
+    bool okR = sR.z > 0.0 && all(greaterThanEqual(uvR, vec2(0.0)))
+                          && all(lessThanEqual(uvR, vec2(1.0)));
+
+    // NV12 upload convention: source row 0 is the image top, but GL texture
+    // v=0 is the bottom — flip v to match (same convention as kFS/kFS_2D).
+    vec3 cL = nv12_to_rgb(uTexY0, uTexUV0, vec2(uvL.x, 1.0 - uvL.y));
+    vec3 cR = nv12_to_rgb(uTexY1, uTexUV1, vec2(uvR.x, 1.0 - uvR.y));
 
     vec3 rgb;
-    if (scene_x < (1.0 - uOverlap)) {
-        rgb = nv12_to_rgb(uTexY0, uTexUV0, uv_L);
-    } else if (scene_x > 1.0) {
-        rgb = nv12_to_rgb(uTexY1, uTexUV1, uv_R);
-    } else {
-        float t = (scene_x - (1.0 - uOverlap)) / uOverlap;
+    if (okL && okR) {
+        // Overlap: blend across the ground-plane X coordinate of this
+        // fragment, since the cameras are mounted symmetrically about X=0.
+        float worldX = (gl_FragCoord.x - uBevWidth * 0.5) / uPxPerM;
+        float t = clamp((worldX + uOverlap) / (2.0 * uOverlap), 0.0, 1.0);
         float s = smoothstep(uBlendEdge, 1.0 - uBlendEdge, t);
-        rgb = mix(nv12_to_rgb(uTexY0, uTexUV0, uv_L),
-                  nv12_to_rgb(uTexY1, uTexUV1, uv_R), s);
+        rgb = mix(cL, cR, s);
+    } else if (okL) {
+        rgb = cL;
+    } else if (okR) {
+        rgb = cR;
+    } else {
+        rgb = vec3(0.0); // no camera covers this ground point
     }
+
     fragColor = vec4(rgb, 1.0);
 }
 )glsl";
@@ -372,8 +411,16 @@ bool GpuRenderer::init_dual(const EGLState &egl, int w, int h, int stride)
     glUniform1i(glGetUniformLocation(prog_dual_, "uTexUV0"), 1);
     glUniform1i(glGetUniformLocation(prog_dual_, "uTexY1"),  2);
     glUniform1i(glGetUniformLocation(prog_dual_, "uTexUV1"), 3);
-    glUniform1f(glGetUniformLocation(prog_dual_, "uOverlap"),    0.86f);
+    // uOverlap is now a blend half-width in meters (was an image-fraction
+    // before IPM); 0.40 m is a reasonable starting width around the
+    // baseline midline, tunable at runtime via set_stitch_overlap().
+    glUniform1f(glGetUniformLocation(prog_dual_, "uOverlap"),    0.40f);
     glUniform1f(glGetUniformLocation(prog_dual_, "uBlendEdge"), 0.45f);
+    // BEV canvas size — fixed for the lifetime of this renderer (same WxH
+    // as the FBO), unlike uOverlap/uBlendEdge/uPxPerM which are tunable.
+    glUniform1f(glGetUniformLocation(prog_dual_, "uBevWidth"),  (float)w);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uBevHeight"), (float)h);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uPxPerM"),    100.0f);
 
     auto make_tex = [](GLuint &t) {
         glGenTextures(1, &t);
@@ -523,6 +570,21 @@ void GpuRenderer::set_blend_edge(float v)
     if (!prog_dual_) return;
     glUseProgram(prog_dual_);
     glUniform1f(glGetUniformLocation(prog_dual_, "uBlendEdge"), v);
+}
+
+void GpuRenderer::set_ipm(const float H_left[9], const float H_right[9])
+{
+    if (!prog_dual_) return;
+    glUseProgram(prog_dual_);
+    glUniformMatrix3fv(glGetUniformLocation(prog_dual_, "uH_L"), 1, GL_FALSE, H_left);
+    glUniformMatrix3fv(glGetUniformLocation(prog_dual_, "uH_R"), 1, GL_FALSE, H_right);
+}
+
+void GpuRenderer::set_px_per_m(float v)
+{
+    if (!prog_dual_) return;
+    glUseProgram(prog_dual_);
+    glUniform1f(glGetUniformLocation(prog_dual_, "uPxPerM"), v);
 }
 
 void GpuRenderer::render_frame(const DmaBufFrame &left, const DmaBufFrame &right)

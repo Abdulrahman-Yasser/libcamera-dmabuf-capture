@@ -34,6 +34,7 @@ add_executable(libcamera-dmabuf-capture
     gpu_renderer.cpp
     dmabuf_import.cpp
     file_source.cpp
+    ipm.cpp
 )
 
 target_link_libraries(libcamera-dmabuf-capture PRIVATE
