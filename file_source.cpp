@@ -140,6 +140,21 @@ DmaBufFrame FileSource::nextFrame()
         frame.uv_offset = uv_off_;
     }
 
+    // One-time framerate probe (vmeta doesn't carry it, so this runs
+    // independently of which layout branch was taken above).
+    if (!fps_probed_) {
+        fps_probed_ = true;
+        GstCaps *scaps = gst_sample_get_caps(last_sample_);
+        GstVideoInfo vi;
+        if (scaps && gst_video_info_from_caps(&vi, scaps)) {
+            fps_n_ = GST_VIDEO_INFO_FPS_N(&vi);
+            fps_d_ = GST_VIDEO_INFO_FPS_D(&vi);
+            if (fps_n_ > 0)
+                std::printf("[file] framerate: %d/%d (%.2f ms/frame)\n",
+                           fps_n_, fps_d_, frame_duration_ms());
+        }
+    }
+
     return frame;
 }
 
@@ -156,4 +171,6 @@ void FileSource::close()
         pipeline_ = appsink_ = nullptr;
     }
     w_ = h_ = stride_ = uv_off_ = 0;
+    fps_n_ = fps_d_ = 0;
+    fps_probed_ = false;
 }

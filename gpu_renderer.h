@@ -56,6 +56,14 @@ public:
 
     bool save_snapshot(const char *path);
 
+    // Sampleable color attachment of the render FBO (GL_TEXTURE_2D) — used to
+    // composite the rendered frame onto a window surface in preview mode.
+    GLuint fbo_texture() const { return fbo_tex_; }
+    // Pixel dimensions of that FBO — needed by preview mode to letterbox/
+    // pillarbox correctly when the window's aspect ratio doesn't match.
+    int    width()  const { return W_; }
+    int    height() const { return H_; }
+
     const GpuStats &gpu_stats() const { return gpu_stats_; }
 
     void cleanup();
@@ -78,8 +86,8 @@ private:
     GLuint prog_      = 0;   // OES path (camera / DMA-BUF)
     GLuint prog_2d_   = 0;   // sampler2D path (single file)
     GLuint prog_dual_ = 0;   // sampler2D × 4 path (dual file)
-    GLuint fbo_  = 0;
-    GLuint rbo_  = 0;
+    GLuint fbo_     = 0;
+    GLuint fbo_tex_ = 0;   // FBO color attachment (GL_TEXTURE_2D, sampleable)
 
     // Camera 0 textures (single and dual modes).
     GLuint tex_y_   = 0;

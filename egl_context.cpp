@@ -4,6 +4,10 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
+#ifdef HAVE_WAYLAND_PREVIEW
+#include <wayland-egl.h>
+#endif
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -117,6 +121,88 @@ bool setup_egl(EGLState &egl)
     return true;
 }
 
+#ifdef HAVE_WAYLAND_PREVIEW
+bool setup_egl_wayland(EGLState &egl, wl_display *display, wl_surface *surface,
+                       int width, int height, wl_egl_window **out_egl_window)
+{
+    /* 1. EGL display straight off the Wayland connection — no GBM/DRM fd. */
+    egl.dpy = eglGetDisplay(reinterpret_cast<EGLNativeDisplayType>(display));
+    if (egl.dpy == EGL_NO_DISPLAY) {
+        std::cerr << "[egl] eglGetDisplay(wl_display) failed\n";
+        return false;
+    }
+
+    EGLint major = 0, minor = 0;
+    if (!eglInitialize(egl.dpy, &major, &minor)) {
+        std::cerr << "[egl] eglInitialize failed: 0x"
+                  << std::hex << eglGetError() << std::dec << "\n";
+        return false;
+    }
+    std::cout << "[egl] EGL version : " << major << "." << minor << " (wayland)\n";
+
+    if (!eglBindAPI(EGL_OPENGL_ES_API))
+        std::cerr << "Maybe EGL_OPENGL_ES_API is not supported ! \n";
+
+    /* 2. Windowed config — must be EGL_WINDOW_BIT, unlike the headless path. */
+    static const EGLint cfg_attribs[] = {
+        EGL_SURFACE_TYPE,    EGL_WINDOW_BIT,
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE,   8,
+        EGL_GREEN_SIZE, 8,
+        EGL_BLUE_SIZE,  8,
+        EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig cfg   = nullptr;
+    EGLint    n_cfg = 0;
+    if (!eglChooseConfig(egl.dpy, cfg_attribs, &cfg, 1, &n_cfg) || n_cfg == 0) {
+        std::cerr << "[egl] no EGL_WINDOW_BIT config found\n";
+        return false;
+    }
+
+    /* 3. GLES 3.0 context — GpuRenderer's shaders are #version 300 es, same
+     *    requirement as the headless path above. */
+    static const EGLint ctx_attribs[] = {
+        EGL_CONTEXT_CLIENT_VERSION, 3,
+        EGL_NONE
+    };
+    egl.ctx = eglCreateContext(egl.dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
+    if (egl.ctx == EGL_NO_CONTEXT) {
+        std::cerr << "[egl] eglCreateContext failed: 0x"
+                  << std::hex << eglGetError() << std::dec << "\n";
+        return false;
+    }
+
+    /* 4. Wrap the wl_surface in an EGL window surface. */
+    *out_egl_window = wl_egl_window_create(surface, width, height);
+    if (!*out_egl_window) {
+        std::cerr << "[egl] wl_egl_window_create failed\n";
+        return false;
+    }
+
+    egl.surface = eglCreateWindowSurface(
+        egl.dpy, cfg,
+        reinterpret_cast<EGLNativeWindowType>(*out_egl_window), nullptr);
+    if (egl.surface == EGL_NO_SURFACE) {
+        std::cerr << "[egl] eglCreateWindowSurface failed: 0x"
+                  << std::hex << eglGetError() << std::dec << "\n";
+        return false;
+    }
+
+    if (!eglMakeCurrent(egl.dpy, egl.surface, egl.surface, egl.ctx)) {
+        std::cerr << "[egl] eglMakeCurrent (windowed) failed: 0x"
+                  << std::hex << eglGetError() << std::dec << "\n";
+        return false;
+    }
+    eglSwapInterval(egl.dpy, 1);
+
+    std::cout << "[egl] GL renderer : " << glGetString(GL_RENDERER) << "\n";
+    std::cout << "[egl] GL version  : " << glGetString(GL_VERSION)  << "\n";
+
+    return true;
+}
+#endif  // HAVE_WAYLAND_PREVIEW
+
 bool check_extensions(const EGLState &egl)
 {
     const char *egl_exts = eglQueryString(egl.dpy, EGL_EXTENSIONS);
@@ -151,6 +237,8 @@ void teardown_egl(EGLState &egl)
         eglMakeCurrent(egl.dpy,
                        EGL_NO_SURFACE, EGL_NO_SURFACE,
                        EGL_NO_CONTEXT);
+        if (egl.surface != EGL_NO_SURFACE)
+            eglDestroySurface(egl.dpy, egl.surface);
         if (egl.ctx != EGL_NO_CONTEXT)
             eglDestroyContext(egl.dpy, egl.ctx);
         eglTerminate(egl.dpy);
