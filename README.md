@@ -331,6 +331,67 @@ camera→GPU path in isolation without depending on the compositor being up, wit
 needing display allocation, and without Wayland protocol overhead. The rendered FBO
 can be handed to any consumer later.
 
+**Update — the Wayland alternative now also exists, as an opt-in mode:** see
+[Live Preview Window](#live-preview-window---preview) below. Headless remains the
+default; nothing above changes unless `--preview` is passed.
+
+---
+
+## Live Preview Window (`--preview`)
+
+For day-to-day shader development it's slow to only ever see output via
+`s`-key PNG snapshots. Passing `--preview` opens a live Wayland window (an
+AGL-shell background client) that shows the shader output continuously, in
+any mode (`--file`, `--file-left`/`--file-right`, or the camera):
+
+```bash
+./libcamera-dmabuf-capture --file clip.h264 --preview
+./libcamera-dmabuf-capture --file-left l.h264 --file-right r.h264 --preview
+./libcamera-dmabuf-capture --preview   # camera mode
+```
+
+**How it works:** the FBO `GpuRenderer` already renders into (§ Pipeline
+Architecture above) has a sampleable `GL_TEXTURE_2D` color attachment. Each
+frame, after the normal render pass, a second pass composites that texture
+onto the preview window via a full-screen triangle and calls
+`eglSwapBuffers` — the same render-to-texture-then-present trick used by
+[wayland-cxx-scanner](https://github.com/jwinarske/wayland-cxx-scanner)'s own
+`agl-presentation-egl` example, vendored here as `extern/wayland-cxx-scanner`
+for its generated C++ Wayland protocol bindings and `agl_shell`/`xdg_wm_base`
+handshake helpers. In `--file`/`--file-left`+`--file-right` mode, playback is
+additionally paced to the clip's real frame rate (decode alone runs faster
+than real time, which would otherwise look fast-forwarded in the window).
+
+This is a stepping stone toward, not a replacement for, the Flutter
+texture-registry integration described in
+[What Comes Next](#what-comes-next) — both share the same FBO-as-texture
+groundwork.
+
+**Build-time requirements:** `--preview` is opt-in and self-disabling —
+`ENABLE_WAYLAND_PREVIEW` defaults `ON`, but the build falls back to
+headless-only (with a warning, not a hard failure) if `wayland-client`,
+`wayland-egl`, `wayland-protocols`, or `wayland-scanner` aren't found.
+
+**Cross-compiling for the RPi4 (Yocto AGL SDK):** `wayland-cxx-scanner`'s
+codegen tool generates the protocol headers at *build* time and must run on
+the host, not the target — a cross build can't produce a binary that runs
+during its own build. Build it natively once, then point the cross build at
+it:
+
+```bash
+# One-time, on the host — builds just the scanner tool (needs libpugixml-dev)
+cmake -S extern/wayland-cxx-scanner -B extern/wayland-cxx-scanner/build-host \
+      -DWAYLAND_CXX_SCANNER_BUILD_EXAMPLES=OFF -DWAYLAND_CXX_SCANNER_BUILD_TESTS=OFF
+cmake --build extern/wayland-cxx-scanner/build-host --target wayland-cxx-scanner
+
+# Then, when configuring the cross build of this project:
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=<AGL SDK toolchain file> \
+      -DWAYLAND_CXX_SCANNER_EXECUTABLE=$(pwd)/extern/wayland-cxx-scanner/build-host/src/wayland-cxx-scanner
+```
+
+Without that variable, a cross build with `ENABLE_WAYLAND_PREVIEW=ON` prints
+a warning and disables the preview window rather than failing the build.
+
 ---
 
 ### 6. 4-buffer pool — all queued at startup

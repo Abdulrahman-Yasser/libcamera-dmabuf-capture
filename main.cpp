@@ -4,15 +4,20 @@
 #include "file_source.h"
 #include "perf_timer.h"
 #include "ipm.h"
+#ifdef HAVE_WAYLAND_PREVIEW
+#include "wayland_window.h"
+#endif
 
 #include <libcamera/libcamera.h>
 
 #include <algorithm>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include <cfloat>
@@ -22,6 +27,17 @@
 #include <unistd.h>
 
 using namespace libcamera;
+
+// Points at the active WaylandPreviewWindow, or null when --preview wasn't
+// requested / this build has no preview support. Kept as a plain type alias
+// (rather than #ifdef-ing every function signature that takes one) so
+// run_file_mode()/run_dual_file_mode() have one signature regardless of
+// HAVE_WAYLAND_PREVIEW.
+#ifdef HAVE_WAYLAND_PREVIEW
+using PreviewWindowPtr = WaylandPreviewWindow *;
+#else
+using PreviewWindowPtr = void *;
+#endif
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -53,6 +69,23 @@ static void restore_stdin()
     tcsetattr(STDIN_FILENO, TCSANOW, &g_old_tio);
 }
 
+// Sleeps just enough to keep file-mode playback paced to the video's real
+// frame rate when --preview is active. file_source.cpp's appsink runs with
+// sync=FALSE, so nextFrame() otherwise returns frames as fast as the decoder
+// produces them, which looks fast-forwarded in a live preview window. No-op
+// when the framerate is unknown. Falls behind gracefully: if we're already
+// past `next_due`, re-anchor to now rather than trying to catch up.
+static void pace_to_framerate(double &next_due, double frame_duration_ms)
+{
+    if (frame_duration_ms <= 0.0) return;
+    next_due += frame_duration_ms;
+    double now = now_ms();
+    if (next_due > now)
+        std::this_thread::sleep_for(std::chrono::duration<double, std::milli>(next_due - now));
+    else
+        next_due = now;
+}
+
 // ── Dual file mode ────────────────────────────────────────────────────────────
 
 // Inverse-perspective-mapping parameters (see ipm.h). Both cameras share
@@ -66,7 +99,8 @@ struct IpmParams {
     double px_per_m = 100.0; // BEV ground-sampling density
 };
 
-static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &egl,
+static int run_dual_file_mode(const char *lpath, const char *rpath,
+                              const EGLState &egl, PreviewWindowPtr preview,
                               const IpmParams &ipm_in)
 {
     FileSource lsrc, rsrc;
@@ -120,10 +154,20 @@ static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &eg
         "G/g=cam_y+-  M/m=px_per_m+-  Ctrl+C=stop\n");
 
     uint64_t total_frames = 0;
+    double   next_due     = now_ms();
 
     while (g_running && lf.data && rf.data) {
         renderer.render_frame(lf, rf);
         ++total_frames;
+
+#ifdef HAVE_WAYLAND_PREVIEW
+        if (preview) {
+            preview->pump_events();
+            preview->present(renderer.fbo_texture(), renderer.width(), renderer.height());
+            if (!preview->running()) g_running = 0;
+            pace_to_framerate(next_due, lsrc.frame_duration_ms());
+        }
+#endif
 
         char key = 0;
         if (read(STDIN_FILENO, &key, 1) == 1) {
@@ -212,7 +256,7 @@ static int run_dual_file_mode(const char *lpath, const char *rpath, EGLState &eg
 
 // ── Single file mode ──────────────────────────────────────────────────────────
 
-static int run_file_mode(const char *path, EGLState &egl)
+static int run_file_mode(const char *path, const EGLState &egl, PreviewWindowPtr preview)
 {
     FileSource fsrc;
     if (!fsrc.open(path)) return 1;
@@ -232,10 +276,20 @@ static int run_file_mode(const char *path, EGLState &egl)
 
     DmaBufFrame frame = first;
     uint64_t total_frames = 0;
+    double   next_due     = now_ms();
 
     while (g_running && frame.data) {
         renderer.render_frame(frame);
         ++total_frames;
+
+#ifdef HAVE_WAYLAND_PREVIEW
+        if (preview) {
+            preview->pump_events();
+            preview->present(renderer.fbo_texture(), renderer.width(), renderer.height());
+            if (!preview->running()) g_running = 0;
+            pace_to_framerate(next_due, fsrc.frame_duration_ms());
+        }
+#endif
 
         char key = 0;
         if (read(STDIN_FILENO, &key, 1) == 1 && (key == 's' || key == 'S')) {
@@ -267,37 +321,71 @@ int main(int argc, char *argv[])
     const char *file_left  = nullptr;
     const char *file_right = nullptr;
     IpmParams   ipm;
-    for (int i = 1; i < argc - 1; ++i) {
+    bool        preview_requested = false;
+    for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--file")            file_path  = argv[i + 1];
-        else if (a == "--file-left")  file_left  = argv[i + 1];
-        else if (a == "--file-right") file_right = argv[i + 1];
-        else if (a == "--baseline")   ipm.baseline = std::atof(argv[i + 1]);
-        else if (a == "--h")          ipm.cam_h    = std::atof(argv[i + 1]);
-        else if (a == "--pitch")      ipm.pitch    = std::atof(argv[i + 1]);
-        else if (a == "--yaw")        ipm.yaw      = std::atof(argv[i + 1]);
-        else if (a == "--cam-y")      ipm.cam_y    = std::atof(argv[i + 1]);
-        else if (a == "--px-per-m")   ipm.px_per_m = std::atof(argv[i + 1]);
+        if (a == "--file"            && i + 1 < argc) file_path  = argv[++i];
+        else if (a == "--file-left"  && i + 1 < argc) file_left  = argv[++i];
+        else if (a == "--file-right" && i + 1 < argc) file_right = argv[++i];
+        else if (a == "--preview") preview_requested = true;
+        else if (a == "--baseline"   && i + 1 < argc) ipm.baseline = std::atof(argv[++i]);
+        else if (a == "--h"          && i + 1 < argc) ipm.cam_h    = std::atof(argv[++i]);
+        else if (a == "--pitch"      && i + 1 < argc) ipm.pitch    = std::atof(argv[++i]);
+        else if (a == "--yaw"        && i + 1 < argc) ipm.yaw      = std::atof(argv[++i]);
+        else if (a == "--cam-y"      && i + 1 < argc) ipm.cam_y    = std::atof(argv[++i]);
+        else if (a == "--px-per-m"   && i + 1 < argc) ipm.px_per_m = std::atof(argv[++i]);
     }
 
-    /* ---- EGL/GBM headless context ---- */
-    EGLState egl;
-    if (!setup_egl(egl)) {
-        teardown_egl(egl); return 1;
+    // Declared before everything else so it's the LAST thing torn down at
+    // function exit (reverse construction order) — GpuRenderer's GL objects
+    // (destroyed via renderer.cleanup()/~GpuRenderer, further down in each
+    // code path) must go away while this still owns a current EGL context.
+#ifdef HAVE_WAYLAND_PREVIEW
+    std::unique_ptr<WaylandPreviewWindow> preview_window;
+    if (preview_requested) {
+        preview_window = std::make_unique<WaylandPreviewWindow>();
+        if (!preview_window->init(1280, 720)) {
+            std::cerr << "[preview] failed to initialize Wayland preview window\n";
+            return 1;
+        }
     }
-    if (!check_extensions(egl)) {
+    PreviewWindowPtr preview_ptr = preview_window.get();
+#else
+    if (preview_requested)
+        std::cerr << "[preview] --preview requested but this build has no "
+                     "Wayland preview support (ENABLE_WAYLAND_PREVIEW was off "
+                     "or its dependencies were missing at configure time)\n";
+    PreviewWindowPtr preview_ptr = nullptr;
+#endif
+    const bool using_preview = preview_ptr != nullptr;
+
+    /* ---- EGL context: windowed (preview) or headless GBM (default) ---- */
+    EGLState egl;  // stays zero-initialized when using_preview — every
+                   // teardown_egl(egl) call below is then a harmless no-op,
+                   // since preview_window owns and tears down the real one.
+    if (!using_preview) {
+        if (!setup_egl(egl)) {
+            teardown_egl(egl); return 1;
+        }
+    }
+#ifdef HAVE_WAYLAND_PREVIEW
+    const EGLState &active_egl = using_preview ? preview_window->egl_state() : egl;
+#else
+    const EGLState &active_egl = egl;
+#endif
+    if (!check_extensions(active_egl)) {
         std::cerr << "[egl] required extensions missing\n";
         teardown_egl(egl); return 1;
     }
     std::cout << "[egl] context ready\n\n";
 
     if (file_left && file_right) {
-        int rc = run_dual_file_mode(file_left, file_right, egl, ipm);
+        int rc = run_dual_file_mode(file_left, file_right, active_egl, preview_ptr, ipm);
         teardown_egl(egl);
         return rc;
     }
     if (file_path) {
-        int rc = run_file_mode(file_path, egl);
+        int rc = run_file_mode(file_path, active_egl, preview_ptr);
         teardown_egl(egl);
         return rc;
     }
@@ -360,7 +448,7 @@ int main(int argc, char *argv[])
 
     /* ---- GPU renderer: compile shader + FBO + EGLImage cache ---- */
     GpuRenderer renderer;
-    if (!renderer.init(egl, sc, alloc.buffers(stream))) {
+    if (!renderer.init(active_egl, sc, alloc.buffers(stream))) {
         camera->release(); cm->stop(); teardown_egl(egl); return 1;
     }
 
@@ -403,6 +491,15 @@ int main(int argc, char *argv[])
         double t_r0         = now_ms();
         renderer.render_frame(buf);
         double cpu_render_ms = now_ms() - t_r0;
+
+#ifdef HAVE_WAYLAND_PREVIEW
+        // No extra pacing needed here — the camera already paces delivery.
+        if (preview_ptr) {
+            preview_ptr->pump_events();
+            preview_ptr->present(renderer.fbo_texture(), renderer.width(), renderer.height());
+            if (!preview_ptr->running()) g_running = 0;
+        }
+#endif
 
         // Non-blocking keyboard check — cost is near zero when no key pressed.
         char key = 0;

@@ -376,13 +376,17 @@ bool GpuRenderer::init(const EGLState &egl, int w, int h, int stride)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 
-    glGenFramebuffers(1,  &fbo_);
-    glGenRenderbuffers(1, &rbo_);
-    glBindRenderbuffer(GL_RENDERBUFFER, rbo_);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, W_, H_);
+    glGenFramebuffers(1, &fbo_);
+    glGenTextures(1,     &fbo_tex_);
+    glBindTexture(GL_TEXTURE_2D, fbo_tex_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W_, H_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                              GL_RENDERBUFFER, rbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, fbo_tex_, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         std::cerr << "[gpu] FBO incomplete\n";
         return false;
@@ -458,13 +462,17 @@ bool GpuRenderer::init(const EGLState &egl,
     glUniform1i(glGetUniformLocation(prog_, "uTexture"), 0);
 
     // ── Create FBO once ───────────────────────────────────────────────────
-    glGenFramebuffers(1,  &fbo_);
-    glGenRenderbuffers(1, &rbo_);
-    glBindRenderbuffer(GL_RENDERBUFFER, rbo_);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, W_, H_);
+    glGenFramebuffers(1, &fbo_);
+    glGenTextures(1,     &fbo_tex_);
+    glBindTexture(GL_TEXTURE_2D, fbo_tex_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W_, H_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                              GL_RENDERBUFFER, rbo_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, fbo_tex_, 0);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         std::cerr << "[gpu] FBO incomplete\n";
         return false;
@@ -507,6 +515,14 @@ void GpuRenderer::render_frame(const FrameBuffer *buf)
         std::cerr << "[gpu] unknown fd=" << fd << " — frame skipped\n";
         return;
     }
+
+    // Re-establish our FBO/program/viewport explicitly rather than assuming
+    // they're still bound — a caller may have rebound framebuffer 0 and a
+    // different program/viewport in between calls (e.g. --preview's window
+    // composite pass), same as the other render_frame() overloads already do.
+    glUseProgram(prog_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glViewport(0, 0, W_, H_);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_EXTERNAL_OES, it->second.texture);
@@ -665,7 +681,7 @@ void GpuRenderer::cleanup()
 
     if (timer_query_ && pfn_DelQueries) { pfn_DelQueries(1, &timer_query_); timer_query_ = 0; }
     if (fbo_)       { glDeleteFramebuffers(1,  &fbo_);       fbo_       = 0; }
-    if (rbo_)       { glDeleteRenderbuffers(1, &rbo_);       rbo_       = 0; }
+    if (fbo_tex_)   { glDeleteTextures(1,      &fbo_tex_);   fbo_tex_   = 0; }
     if (prog_)      { glDeleteProgram(prog_);                 prog_      = 0; }
     if (prog_2d_)   { glDeleteProgram(prog_2d_);              prog_2d_   = 0; }
     if (prog_dual_) { glDeleteProgram(prog_dual_);            prog_dual_ = 0; }
