@@ -156,6 +156,19 @@ static int run_dual_file_mode(const char *lpath, const char *rpath,
     uint64_t total_frames = 0;
     double   next_due     = now_ms();
 
+    // Temporary workaround for the agl-compositor background-surface exit
+    // crash (see wayland_window.cpp's top comment): loop each file forever
+    // on EOS instead of ending the run, so this process — and therefore its
+    // agl_shell background surface — never exits while --preview is active.
+    auto loop_on_eos = [](FileSource &src, const char *path, DmaBufFrame &frame) {
+        frame = src.nextFrame();
+        if (!frame.data) {
+            std::printf("[dual] EOS — looping %s\n", path);
+            src.close();
+            if (src.open(path)) frame = src.nextFrame();
+        }
+    };
+
     while (g_running && lf.data && rf.data) {
         renderer.render_frame(lf, rf);
         ++total_frames;
@@ -243,8 +256,8 @@ static int run_dual_file_mode(const char *lpath, const char *rpath,
             }
         }
 
-        lf = lsrc.nextFrame();
-        rf = rsrc.nextFrame();
+        loop_on_eos(lsrc, lpath, lf);
+        loop_on_eos(rsrc, rpath, rf);
     }
 
     std::printf("[loop] dual mode stopped after %llu frames\n",
