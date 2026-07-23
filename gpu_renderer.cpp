@@ -124,6 +124,60 @@ void main() {
 }
 )glsl";
 
+// Single-camera forward BEV shader — the same backward-warp idea as
+// kFS_DUAL's per-camera projection above, just one camera and no blend.
+// First step toward the eventual front/back/left/right 4-camera BEV blend;
+// kept separate from kFS_DUAL rather than adding a "camera count" branch to
+// it, so composing the 4-camera version later means adding more of these,
+// not restructuring this one.
+static const char kFS_BEV[] = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D uTexY;
+uniform sampler2D uTexUV;
+
+// BEV-pixel -> camera-image homography, column-major, pre-normalized to
+// [0,1] (see ground_to_image_H() in ipm.cpp). uv = (H*p).xy / (H*p).z.
+uniform mat3 uH;
+
+// BEV canvas size in pixels (matches the FBO/render size; set once at
+// init_bev, not runtime-tunable) — needed for the same gl_FragCoord.y flip
+// kFS_DUAL uses (ground_to_image_H()'s M matrix assumes top-origin "py",
+// GLES's gl_FragCoord.y is bottom-origin).
+uniform float uBevWidth;
+uniform float uBevHeight;
+
+out vec4 fragColor;
+
+void main() {
+    vec3 p = vec3(gl_FragCoord.x, uBevHeight - gl_FragCoord.y, 1.0);
+    vec3 s = uH * p;
+    vec2 uv = s.xy / s.z;   // perspective divide
+
+    // Validity: inside [0,1] AND in front of the camera (z acts as depth).
+    bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))
+                        && all(lessThanEqual(uv, vec2(1.0)));
+    if (!ok) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0); // no ground coverage here
+        return;
+    }
+
+    // No flip here, unlike kFS/kFS_2D's screen-position sampling: `uv` comes
+    // from ground_to_image_H(), which already uses standard image-space math
+    // (cy = height/2, v increasing downward) — the same row-order convention
+    // the decoded NV12 buffer (and therefore this texture's v) already has.
+    // kFS_2D's "1.0 - v" flip corrects a *different* mismatch (NDC-derived
+    // vTexCoord vs. texture v have opposite polarity); it doesn't apply to a
+    // homography-derived uv, which already matches the texture directly.
+    float Y  = texture(uTexY,  uv).r;
+    vec2  UV = texture(uTexUV, uv).rg - 0.5;
+    float R  = clamp(Y + 1.402  * UV.y,                0.0, 1.0);
+    float G  = clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0);
+    float B  = clamp(Y + 1.772  * UV.x,                0.0, 1.0);
+    fragColor = vec4(R, G, B, 1.0);
+}
+)glsl";
+
 static const char kVS[] = R"glsl(
 #version 300 es
 out vec2 vTexCoord;
@@ -441,6 +495,36 @@ bool GpuRenderer::init_dual(const EGLState &egl, int w, int h, int stride)
     return true;
 }
 
+bool GpuRenderer::init_bev()
+{
+    // Assumes init() (single-file mode) has already run — needs tex_y_/
+    // tex_uv_/fbo_ and W_/H_, same as the dual path relies on init_dual()
+    // calling init() first.
+    double t0 = now_ms();
+    prog_bev_ = build_program(kVS, kFS_BEV);
+    if (!prog_bev_) return false;
+    std::printf("[gpu] bev shader compile+link : %.1f ms\n", now_ms() - t0);
+
+    glUseProgram(prog_bev_);
+    glUniform1i(glGetUniformLocation(prog_bev_, "uTexY"),  0);
+    glUniform1i(glGetUniformLocation(prog_bev_, "uTexUV"), 1);
+    // BEV canvas size — fixed for the lifetime of this renderer (same WxH
+    // as the FBO), matching kFS_DUAL's uBevWidth/uBevHeight.
+    glUniform1f(glGetUniformLocation(prog_bev_, "uBevWidth"),  (float)W_);
+    glUniform1f(glGetUniformLocation(prog_bev_, "uBevHeight"), (float)H_);
+    bev_u_H_ = glGetUniformLocation(prog_bev_, "uH");
+
+    std::printf("[gpu] bev (forward, single-camera) ready: %dx%d\n", W_, H_);
+    return true;
+}
+
+void GpuRenderer::set_bev(const float H[9])
+{
+    if (!prog_bev_) return;
+    glUseProgram(prog_bev_);
+    glUniformMatrix3fv(bev_u_H_, 1, GL_FALSE, H);
+}
+
 bool GpuRenderer::init(const EGLState &egl,
                        const StreamConfiguration &sc,
                        const std::vector<std::unique_ptr<FrameBuffer>> &buffers)
@@ -541,7 +625,7 @@ void GpuRenderer::render_frame(const DmaBufFrame &frame)
     if (frame.fd < 0) {
         // System memory path (file mode).
         upload_nv12(frame, tex_y_, tex_uv_, 0, 1);
-        glUseProgram(prog_2d_);
+        glUseProgram(bev_enabled_ && prog_bev_ ? prog_bev_ : prog_2d_);
         glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
         glViewport(0, 0, W_, H_);
         if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
@@ -622,6 +706,14 @@ void GpuRenderer::render_frame(const DmaBufFrame &left, const DmaBufFrame &right
 
 bool GpuRenderer::save_snapshot(const char *path)
 {
+    // Re-bind our FBO explicitly rather than assuming it's still current —
+    // a caller may have rebound framebuffer 0 in between (e.g. --preview's
+    // window composite pass), same fix as render_frame(FrameBuffer*) needed.
+    // Reading framebuffer 0 right after eglSwapBuffers() is especially bad:
+    // that buffer's contents are undefined until the next frame renders,
+    // which is why this previously read back as uniform (0,0,0,0) garbage.
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+
     // glFlush was already called in render_frame(); wait for GPU to finish.
     glFinish();
 
@@ -685,6 +777,7 @@ void GpuRenderer::cleanup()
     if (prog_)      { glDeleteProgram(prog_);                 prog_      = 0; }
     if (prog_2d_)   { glDeleteProgram(prog_2d_);              prog_2d_   = 0; }
     if (prog_dual_) { glDeleteProgram(prog_dual_);            prog_dual_ = 0; }
+    if (prog_bev_)  { glDeleteProgram(prog_bev_);             prog_bev_  = 0; }
     if (tex_y_)     { glDeleteTextures(1, &tex_y_);          tex_y_     = 0; }
     if (tex_uv_)    { glDeleteTextures(1, &tex_uv_);         tex_uv_    = 0; }
     if (tex_y2_)    { glDeleteTextures(1, &tex_y2_);         tex_y2_    = 0; }

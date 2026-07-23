@@ -63,6 +63,17 @@ public:
     // again, since px_per_m is baked into those matrices.
     void set_px_per_m(float px_per_m);
 
+    // Single-camera forward BEV (single-file mode only) — the same
+    // ground_to_image_H() backward-warp idea as the dual-camera stitch
+    // above, just one camera and no blend. Kept as its own program/method
+    // pair (rather than a "camera count" flag bolted onto kFS_DUAL) so it
+    // composes cleanly with the planned front/back/left/right 4-camera BEV
+    // blend later, instead of being a throwaway shortcut.
+    bool init_bev();  // compiles the single-camera BEV shader; call once after init().
+    void set_bev_enabled(bool on) { bev_enabled_ = on; }
+    bool bev_enabled() const { return bev_enabled_; }
+    void set_bev(const float H[9]);  // column-major, from ground_to_image_H()
+
     bool save_snapshot(const char *path);
 
     // Sampleable color attachment of the render FBO (GL_TEXTURE_2D) — used to
@@ -95,6 +106,9 @@ private:
     GLuint prog_      = 0;   // OES path (camera / DMA-BUF)
     GLuint prog_2d_   = 0;   // sampler2D path (single file)
     GLuint prog_dual_ = 0;   // sampler2D × 4 path (dual file)
+    GLuint prog_bev_  = 0;   // sampler2D single-camera BEV path (single file)
+    GLint  bev_u_H_     = -1;
+    bool   bev_enabled_ = false;
     GLuint fbo_     = 0;
     GLuint fbo_tex_ = 0;   // FBO color attachment (GL_TEXTURE_2D, sampleable)
 

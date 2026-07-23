@@ -269,7 +269,8 @@ static int run_dual_file_mode(const char *lpath, const char *rpath,
 
 // ── Single file mode ──────────────────────────────────────────────────────────
 
-static int run_file_mode(const char *path, const EGLState &egl, PreviewWindowPtr preview)
+static int run_file_mode(const char *path, const EGLState &egl, PreviewWindowPtr preview,
+                         const IpmParams &ipm_in, bool bev_requested)
 {
     FileSource fsrc;
     if (!fsrc.open(path)) return 1;
@@ -284,12 +285,56 @@ static int run_file_mode(const char *path, const EGLState &egl, PreviewWindowPtr
     GpuRenderer renderer;
     if (!renderer.init(egl, first.width, first.height, first.stride)) return 1;
 
+    // Forward BEV (single camera, no blend) — first step toward the planned
+    // front/back/left/right 4-camera BEV blend; reuses the exact same
+    // ground_to_image_H() math as the dual-camera stitch, just cam_x=0 (no
+    // baseline) since there's only one camera here.
+    bool bev_on = false;
+    IpmParams ipm = ipm_in;
+    if (bev_requested) {
+        if (!renderer.init_bev()) return 1;
+        renderer.set_bev_enabled(true);
+        bev_on = true;
+    }
+
+    auto rebuild_bev = [&](const char *changed) {
+        mat3 K = build_intrinsics(first.width, first.height);
+        mat3 H = ground_to_image_H(0.0, ipm.cam_y, ipm.cam_h, ipm.pitch, ipm.yaw, K,
+                                   first.width, first.height, ipm.px_per_m,
+                                   first.width, first.height);
+        float Hf[9];
+        H.to_floats(Hf);
+        renderer.set_bev(Hf);
+        std::printf("[bev] %-10s h=%.2fm pitch=%.1fdeg yaw=%.1fdeg cam_y=%.2fm "
+                    "px_per_m=%.1f\n",
+                    changed, ipm.cam_h, ipm.pitch, ipm.yaw, ipm.cam_y, ipm.px_per_m);
+    };
+    if (bev_on) rebuild_bev("init");
+
     enable_raw_stdin();
-    std::cout << "[loop] file mode — press 's' to save snapshot, Ctrl+C to stop\n";
+    if (bev_on)
+        std::printf("[keys] s=snapshot  c=sanity-check  H/h=height+-  P/p=pitch+-  "
+                    "Y/y=yaw+-  G/g=cam_y+-  M/m=px_per_m+-  Ctrl+C=stop\n");
+    else
+        std::cout << "[loop] file mode — press 's' to save snapshot, Ctrl+C to stop\n";
 
     DmaBufFrame frame = first;
     uint64_t total_frames = 0;
     double   next_due     = now_ms();
+
+    // Loop on EOS instead of ending the run — same as run_dual_file_mode
+    // (see wayland_window.cpp's top comment re: the agl-compositor
+    // background-surface exit crash) and, independent of that, generally
+    // more useful for a live preview: keep playing rather than freezing on
+    // the last frame once the clip runs out.
+    auto loop_on_eos = [&]() {
+        frame = fsrc.nextFrame();
+        if (!frame.data) {
+            std::printf("[file] EOS — looping %s\n", path);
+            fsrc.close();
+            if (fsrc.open(path)) frame = fsrc.nextFrame();
+        }
+    };
 
     while (g_running && frame.data) {
         renderer.render_frame(frame);
@@ -305,14 +350,52 @@ static int run_file_mode(const char *path, const EGLState &egl, PreviewWindowPtr
 #endif
 
         char key = 0;
-        if (read(STDIN_FILENO, &key, 1) == 1 && (key == 's' || key == 'S')) {
-            static int snap_idx = 0;
-            char snap_path[64];
-            std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
-            renderer.save_snapshot(snap_path);
+        if (read(STDIN_FILENO, &key, 1) == 1) {
+            if (key == 's' || key == 'S') {
+                static int snap_idx = 0;
+                char snap_path[64];
+                std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
+                renderer.save_snapshot(snap_path);
+            } else if (bev_on && key == 'c') {
+                mat3 K = build_intrinsics(first.width, first.height);
+                mat3 H = ground_to_image_H(0.0, ipm.cam_y, ipm.cam_h, ipm.pitch, ipm.yaw, K,
+                                           first.width, first.height, ipm.px_per_m,
+                                           first.width, first.height);
+                ipm_debug_check(H, first.width, first.height, "forward");
+            } else if (bev_on && key == 'H') {
+                ipm.cam_h = std::min(ipm.cam_h + 0.05, 3.0);
+                rebuild_bev("height+");
+            } else if (bev_on && key == 'h') {
+                ipm.cam_h = std::max(ipm.cam_h - 0.05, 0.2);
+                rebuild_bev("height-");
+            } else if (bev_on && key == 'P') {
+                ipm.pitch = std::min(ipm.pitch + 1.0, -1.0);
+                rebuild_bev("pitch+");
+            } else if (bev_on && key == 'p') {
+                ipm.pitch = std::max(ipm.pitch - 1.0, -89.0);
+                rebuild_bev("pitch-");
+            } else if (bev_on && key == 'Y') {
+                ipm.yaw = std::min(ipm.yaw + 1.0, 90.0);
+                rebuild_bev("yaw+");
+            } else if (bev_on && key == 'y') {
+                ipm.yaw = std::max(ipm.yaw - 1.0, -90.0);
+                rebuild_bev("yaw-");
+            } else if (bev_on && key == 'G') {
+                ipm.cam_y = std::min(ipm.cam_y + 0.05, 5.0);
+                rebuild_bev("cam_y+");
+            } else if (bev_on && key == 'g') {
+                ipm.cam_y = std::max(ipm.cam_y - 0.05, -5.0);
+                rebuild_bev("cam_y-");
+            } else if (bev_on && key == 'M') {
+                ipm.px_per_m = std::min(ipm.px_per_m + 5.0, 500.0);
+                rebuild_bev("px_per_m+");
+            } else if (bev_on && key == 'm') {
+                ipm.px_per_m = std::max(ipm.px_per_m - 5.0, 10.0);
+                rebuild_bev("px_per_m-");
+            }
         }
 
-        frame = fsrc.nextFrame();
+        loop_on_eos();
     }
 
     std::printf("[loop] file mode stopped after %llu frames\n",
@@ -335,12 +418,14 @@ int main(int argc, char *argv[])
     const char *file_right = nullptr;
     IpmParams   ipm;
     bool        preview_requested = false;
+    bool        bev_requested     = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--file"            && i + 1 < argc) file_path  = argv[++i];
         else if (a == "--file-left"  && i + 1 < argc) file_left  = argv[++i];
         else if (a == "--file-right" && i + 1 < argc) file_right = argv[++i];
         else if (a == "--preview") preview_requested = true;
+        else if (a == "--bev") bev_requested = true;
         else if (a == "--baseline"   && i + 1 < argc) ipm.baseline = std::atof(argv[++i]);
         else if (a == "--h"          && i + 1 < argc) ipm.cam_h    = std::atof(argv[++i]);
         else if (a == "--pitch"      && i + 1 < argc) ipm.pitch    = std::atof(argv[++i]);
@@ -398,7 +483,7 @@ int main(int argc, char *argv[])
         return rc;
     }
     if (file_path) {
-        int rc = run_file_mode(file_path, active_egl, preview_ptr);
+        int rc = run_file_mode(file_path, active_egl, preview_ptr, ipm, bev_requested);
         teardown_egl(egl);
         return rc;
     }
