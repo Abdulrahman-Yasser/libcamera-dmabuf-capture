@@ -4,6 +4,7 @@
 #include <drm/drm_fourcc.h>
 #include <png.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -175,6 +176,137 @@ void main() {
     float G  = clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0);
     float B  = clamp(Y + 1.772  * UV.x,                0.0, 1.0);
     fragColor = vec4(R, G, B, 1.0);
+}
+)glsl";
+
+// N-camera surround-view BEV shader (--src mode). Same per-fragment
+// backward-warp idea as kFS_DUAL/kFS_BEV above, generalized two ways:
+//
+//   1. Up to MAX_CAMERAS independently-posed cameras instead of exactly 2 —
+//      each camera gets its own homography uH[i] (built the same way as
+//      uH_L/uH_R, one ground_to_image_H() call per camera) and its own
+//      "facing bearing" uFacingDeg[i], derived from that camera's yaw (see
+//      BEV_ALGORITHM.md's "yaw -> facing" formula). uNumCameras is a
+//      *runtime* uniform used only as a continue-guard inside a loop whose
+//      *bound* is the compile-time MAX_CAMERAS constant — GLSL ES 3.00 does
+//      not reliably support genuinely dynamic (data-dependent) indexing of a
+//      sampler array, but a for-loop with a constant bound is the
+//      spec-legal "constant-index-expression" form, so uTexY[i]/uTexUV[i]/
+//      uH[i] stay portable even though i is a variable.
+//   2. kFS_DUAL's single-axis (world X=0) 2-camera blend doesn't generalize
+//      to cameras arranged around a vehicle (multiple corner overlaps, not
+//      one shared seam) — replaced with a weighted angular blend: each
+//      valid camera contributes color weighted by how close this fragment's
+//      bearing (relative to the BEV canvas center) is to that camera's own
+//      facing bearing, normalized by the sum of weights. This handles any
+//      number of simultaneously-overlapping cameras (e.g. 3+ near a corner)
+//      without pairwise seam special-casing. uOverlap is reinterpreted as an
+//      angular half-width in *degrees* (was meters in kFS_DUAL); uBlendEdge
+//      keeps its exact existing meaning/formula.
+static const char kFS_MULTI[] = R"glsl(
+#version 300 es
+precision mediump float;
+
+#define MAX_CAMERAS 8
+
+uniform sampler2D uTexY[MAX_CAMERAS];
+uniform sampler2D uTexUV[MAX_CAMERAS];
+// BEV-pixel -> camera-image homographies, one per camera (see
+// ground_to_image_H() in ipm.cpp), column-major, pre-normalized to [0,1].
+uniform mat3  uH[MAX_CAMERAS];
+// Each camera's facing bearing, degrees, world atan2(Y,X) convention
+// (derived from that camera's yaw — see BEV_ALGORITHM.md).
+uniform float uFacingDeg[MAX_CAMERAS];
+uniform int   uNumCameras;
+
+// BEV canvas size in pixels (matches the FBO/render size; set once at
+// init_multi, not runtime-tunable).
+uniform float uBevWidth;
+uniform float uBevHeight;
+// BEV ground-sampling density, pixels per meter — shared/global (one output
+// canvas), already baked into uH[]; kept as a uniform so the blend math
+// below (which recovers world-space X/Y from gl_FragCoord) stays in sync.
+uniform float uPxPerM;
+
+// Angular half-width, degrees, of the blend zone centered on each camera's
+// facing bearing. Needs to be at least half the largest gap between
+// adjacent camera facings or a black wedge appears between them.
+uniform float uOverlap;
+// Controls sharpness of the crossover within the blend zone — identical
+// meaning/formula to kFS_DUAL's uBlendEdge.
+uniform float uBlendEdge;
+
+out vec4 fragColor;
+
+const float kPi = 3.14159265358979;
+
+// Mesa's GLSL ES 3.00 compiler (confirmed on the real V3D target) rejects
+// ANY variable index into a sampler array — including uTexY[i] inside a
+// texture() call where i is a compile-time-bounded loop variable. It does
+// not perform loop-unrolling before that check, so the "canonical constant-
+// bound for-loop" exception the spec allows isn't honored here in practice.
+// The portable fix: unroll the loop in the GLSL *source text* itself via
+// this macro, so every sampler-array subscript is a literal integer — no
+// variable indexing anywhere, satisfying even the strictest compiler.
+#define PROCESS_CAMERA(IDX)                                                  \
+    if (IDX < uNumCameras) {                                                 \
+        vec3 s  = uH[IDX] * p;                                              \
+        vec2 uv = s.xy / s.z;                                               \
+        bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))         \
+                            && all(lessThanEqual(uv, vec2(1.0)));           \
+        if (ok) {                                                           \
+            /* Angular distance from this fragment's bearing to camera */   \
+            /* IDX's facing, wrapped to (-pi, pi]. */                       \
+            float d   = mod(thetaFrag - radians(uFacingDeg[IDX]) + kPi,     \
+                            2.0 * kPi) - kPi;                               \
+            float raw = clamp(1.0 - abs(d) / radians(uOverlap), 0.0, 1.0);  \
+            float w   = smoothstep(uBlendEdge, 1.0 - uBlendEdge, raw);      \
+            if (w > 0.0) {                                                  \
+                /* NV12->RGB; same upload-convention flip as kFS_DUAL. */   \
+                vec2 uv2 = vec2(uv.x, 1.0 - uv.y);                          \
+                float Y  = texture(uTexY[IDX],  uv2).r;                    \
+                vec2  UV = texture(uTexUV[IDX], uv2).rg - 0.5;              \
+                vec3  c  = vec3(                                            \
+                    clamp(Y + 1.402  * UV.y,                0.0, 1.0),     \
+                    clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0),     \
+                    clamp(Y + 1.772  * UV.x,                0.0, 1.0));    \
+                colorSum  += c * w;                                         \
+                weightSum += w;                                            \
+            }                                                               \
+        }                                                                    \
+    }
+
+void main() {
+    // This fragment IS a point on the BEV output plane (same top-origin
+    // flip kFS_DUAL/kFS_BEV use for the homography lookup).
+    vec3 p = vec3(gl_FragCoord.x, uBevHeight - gl_FragCoord.y, 1.0);
+
+    // This fragment's bearing relative to the BEV canvas center — used only
+    // for blend weighting, not for the per-camera homography lookup above.
+    float worldX    = (gl_FragCoord.x - uBevWidth  * 0.5) / uPxPerM;
+    float worldY    = (gl_FragCoord.y - uBevHeight * 0.5) / uPxPerM;
+    float thetaFrag = atan(worldY, worldX);
+
+    vec3  colorSum  = vec3(0.0);
+    float weightSum = 0.0;
+
+    // Manually unrolled (see PROCESS_CAMERA comment above) — one literal
+    // invocation per MAX_CAMERAS slot (8); extras beyond uNumCameras are
+    // skipped at runtime by the "IDX < uNumCameras" check, but the array
+    // index itself stays a compile-time literal in every one. If
+    // MAX_CAMERAS / GpuRenderer::kMaxCameras ever changes, this list of
+    // literal invocations must be added to or trimmed to match — the GLSL
+    // preprocessor can't generate them from MAX_CAMERAS automatically.
+    PROCESS_CAMERA(0)
+    PROCESS_CAMERA(1)
+    PROCESS_CAMERA(2)
+    PROCESS_CAMERA(3)
+    PROCESS_CAMERA(4)
+    PROCESS_CAMERA(5)
+    PROCESS_CAMERA(6)
+    PROCESS_CAMERA(7)
+
+    fragColor = vec4(weightSum > 0.0 ? colorSum / weightSum : vec3(0.0), 1.0);
 }
 )glsl";
 
@@ -660,16 +792,26 @@ void GpuRenderer::render_frame(const DmaBufFrame &frame)
 
 void GpuRenderer::set_stitch_overlap(float v)
 {
-    if (!prog_dual_) return;
-    glUseProgram(prog_dual_);
-    glUniform1f(glGetUniformLocation(prog_dual_, "uOverlap"), v);
+    if (prog_dual_) {
+        glUseProgram(prog_dual_);
+        glUniform1f(glGetUniformLocation(prog_dual_, "uOverlap"), v);
+    }
+    if (prog_multi_) {
+        glUseProgram(prog_multi_);
+        glUniform1f(glGetUniformLocation(prog_multi_, "uOverlap"), v);
+    }
 }
 
 void GpuRenderer::set_blend_edge(float v)
 {
-    if (!prog_dual_) return;
-    glUseProgram(prog_dual_);
-    glUniform1f(glGetUniformLocation(prog_dual_, "uBlendEdge"), v);
+    if (prog_dual_) {
+        glUseProgram(prog_dual_);
+        glUniform1f(glGetUniformLocation(prog_dual_, "uBlendEdge"), v);
+    }
+    if (prog_multi_) {
+        glUseProgram(prog_multi_);
+        glUniform1f(glGetUniformLocation(prog_multi_, "uBlendEdge"), v);
+    }
 }
 
 void GpuRenderer::set_ipm(const float H_left[9], const float H_right[9])
@@ -682,9 +824,14 @@ void GpuRenderer::set_ipm(const float H_left[9], const float H_right[9])
 
 void GpuRenderer::set_px_per_m(float v)
 {
-    if (!prog_dual_) return;
-    glUseProgram(prog_dual_);
-    glUniform1f(glGetUniformLocation(prog_dual_, "uPxPerM"), v);
+    if (prog_dual_) {
+        glUseProgram(prog_dual_);
+        glUniform1f(glGetUniformLocation(prog_dual_, "uPxPerM"), v);
+    }
+    if (prog_multi_) {
+        glUseProgram(prog_multi_);
+        glUniform1f(glGetUniformLocation(prog_multi_, "uPxPerM"), v);
+    }
 }
 
 void GpuRenderer::render_frame(const DmaBufFrame &left, const DmaBufFrame &right)
@@ -695,6 +842,110 @@ void GpuRenderer::render_frame(const DmaBufFrame &left, const DmaBufFrame &right
     upload_nv12(right, tex_y2_, tex_uv2_, 2, 3);
 
     glUseProgram(prog_dual_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glViewport(0, 0, W_, H_);
+
+    if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    glFlush();
+}
+
+bool GpuRenderer::init_multi(const EGLState &egl, int w, int h, int stride, int num_cameras)
+{
+    if (num_cameras < 1 || num_cameras > kMaxCameras) {
+        std::cerr << "[gpu] init_multi: num_cameras=" << num_cameras
+                  << " out of range [1," << kMaxCameras << "]\n";
+        return false;
+    }
+
+    // GLES 3.0 only guarantees 16 fragment texture image units — 2 per
+    // camera (Y+UV) means kMaxCameras=8 is already at that guaranteed
+    // floor. Check the real driver limit too, since some hardware may not
+    // even reach the guaranteed minimum in practice.
+    GLint max_units = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_IMAGE_UNITS, &max_units);
+    if (2 * num_cameras > max_units) {
+        std::cerr << "[gpu] init_multi: " << num_cameras << " cameras need "
+                  << (2 * num_cameras) << " texture units, but this driver "
+                     "only supports " << max_units << "\n";
+        return false;
+    }
+
+    // Build the base single-file setup (FBO, tex_y_, tex_uv_, prog_2d_) —
+    // unused by multi mode, but every specialized init_*() delegates here
+    // for the shared FBO/viewport/timer-query setup, same as init_dual()/
+    // init_bev() already do.
+    if (!init(egl, w, h, stride)) return false;
+
+    double t0 = now_ms();
+    prog_multi_ = build_program(kVS, kFS_MULTI);
+    if (!prog_multi_) return false;
+    std::printf("[gpu] multi (%d-camera) shader compile+link : %.1f ms\n",
+                num_cameras, now_ms() - t0);
+
+    glUseProgram(prog_multi_);
+    char name[32];
+    for (int i = 0; i < num_cameras; ++i) {
+        std::snprintf(name, sizeof(name), "uTexY[%d]", i);
+        glUniform1i(glGetUniformLocation(prog_multi_, name), 2 * i);
+        std::snprintf(name, sizeof(name), "uTexUV[%d]", i);
+        glUniform1i(glGetUniformLocation(prog_multi_, name), 2 * i + 1);
+
+        std::snprintf(name, sizeof(name), "uH[%d]", i);
+        u_H_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uFacingDeg[%d]", i);
+        u_facing_multi_[i] = glGetUniformLocation(prog_multi_, name);
+    }
+    glUniform1i(glGetUniformLocation(prog_multi_, "uNumCameras"), num_cameras);
+
+    // Defaults — 60 deg overlap gives margin over the 45 deg minimum needed
+    // for 4 evenly-spaced (90 deg apart) cameras to fully cover 360 deg;
+    // tunable at runtime via set_stitch_overlap() (now in degrees).
+    glUniform1f(glGetUniformLocation(prog_multi_, "uOverlap"),    60.0f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uBlendEdge"), 0.45f);
+    // BEV canvas size — fixed for the lifetime of this renderer, matching
+    // kFS_DUAL's uBevWidth/uBevHeight.
+    glUniform1f(glGetUniformLocation(prog_multi_, "uBevWidth"),  (float)w);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uBevHeight"), (float)h);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uPxPerM"),    100.0f);
+
+    auto make_tex = [](GLuint &t) {
+        glGenTextures(1, &t);
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
+    for (int i = 0; i < num_cameras; ++i) {
+        make_tex(tex_y_multi_[i]);
+        make_tex(tex_uv_multi_[i]);
+    }
+
+    num_cameras_multi_ = num_cameras;
+    std::printf("[gpu] renderer ready (%d-camera surround mode): %dx%d\n",
+                num_cameras, W_, H_);
+    return true;
+}
+
+void GpuRenderer::set_ipm_multi(int slot, const float H[9], float facing_deg)
+{
+    if (!prog_multi_ || slot < 0 || slot >= num_cameras_multi_) return;
+    glUseProgram(prog_multi_);
+    glUniformMatrix3fv(u_H_multi_[slot], 1, GL_FALSE, H);
+    glUniform1f(u_facing_multi_[slot], facing_deg);
+}
+
+void GpuRenderer::render_frame_multi(const std::vector<DmaBufFrame> &frames)
+{
+    collect_timer();
+
+    int n = std::min((int)frames.size(), num_cameras_multi_);
+    for (int i = 0; i < n; ++i)
+        upload_nv12(frames[i], tex_y_multi_[i], tex_uv_multi_[i], 2 * i, 2 * i + 1);
+
+    glUseProgram(prog_multi_);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
     glViewport(0, 0, W_, H_);
 
@@ -778,10 +1029,16 @@ void GpuRenderer::cleanup()
     if (prog_2d_)   { glDeleteProgram(prog_2d_);              prog_2d_   = 0; }
     if (prog_dual_) { glDeleteProgram(prog_dual_);            prog_dual_ = 0; }
     if (prog_bev_)  { glDeleteProgram(prog_bev_);             prog_bev_  = 0; }
+    if (prog_multi_) { glDeleteProgram(prog_multi_);          prog_multi_ = 0; }
     if (tex_y_)     { glDeleteTextures(1, &tex_y_);          tex_y_     = 0; }
     if (tex_uv_)    { glDeleteTextures(1, &tex_uv_);         tex_uv_    = 0; }
     if (tex_y2_)    { glDeleteTextures(1, &tex_y2_);         tex_y2_    = 0; }
     if (tex_uv2_)   { glDeleteTextures(1, &tex_uv2_);        tex_uv2_   = 0; }
+    for (int i = 0; i < num_cameras_multi_; ++i) {
+        if (tex_y_multi_[i])  { glDeleteTextures(1, &tex_y_multi_[i]);  tex_y_multi_[i]  = 0; }
+        if (tex_uv_multi_[i]) { glDeleteTextures(1, &tex_uv_multi_[i]); tex_uv_multi_[i] = 0; }
+    }
+    num_cameras_multi_ = 0;
 
     egl_ = nullptr;
 }

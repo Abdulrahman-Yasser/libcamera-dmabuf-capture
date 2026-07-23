@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -405,6 +406,296 @@ static int run_file_mode(const char *path, const EGLState &egl, PreviewWindowPtr
     return 0;
 }
 
+// ── N-camera surround-view mode ─────────────────────────────────────────────────
+
+// Per-slot camera pose — fully independent, unlike IpmParams's shared
+// height/pitch/yaw (dual mode) or hardcoded cam_x=0 (single-camera BEV
+// mode). px_per_m and the BEV canvas size stay global/shared (one output
+// canvas), so they're not in here.
+struct SlotParams {
+    double cam_x = 0.0, cam_y = 0.0, cam_h = 1.2, pitch = -30.0, yaw = 0.0;
+};
+
+struct Slot {
+    std::string                 path;
+    SlotParams                  params;
+    std::unique_ptr<FileSource> src;
+    DmaBufFrame                 frame;
+};
+
+// Facing bearing (degrees, world atan2(Y,X) convention) that a camera at
+// this yaw points at — see BEV_ALGORITHM.md. Verified against
+// build_rotation(): yaw=0 -> 90 (+Y/front), yaw=-90 -> 0 (+X/right),
+// yaw=180 -> 270 (-Y/back), yaw=90 -> 180 (-X/left).
+static double facing_deg_from_yaw(double yaw_deg)
+{
+    double f = std::fmod(90.0 + yaw_deg, 360.0);
+    if (f < 0.0) f += 360.0;
+    return f;
+}
+
+static int run_multi_file_mode(const std::vector<std::string> &paths,
+                               const EGLState &egl, PreviewWindowPtr preview,
+                               double initial_px_per_m)
+{
+    int n = (int)paths.size();
+    if (n < 1 || n > GpuRenderer::kMaxCameras) {
+        std::cerr << "[multi] " << n << " sources requested, must be 1.."
+                  << GpuRenderer::kMaxCameras << "\n";
+        return 1;
+    }
+
+    // Direction defaults for the first 4 slots (front/right/back/left);
+    // slot 5+ gets neutral defaults (SlotParams{}). cam_x/cam_y are
+    // illustrative starting mounting offsets, not physically authoritative
+    // — fully live-tunable via X/x and G/g.
+    static const SlotParams kDirectionDefaults[4] = {
+        { 0.0,  1.0, 1.2, -30.0,   0.0}, // front
+        { 0.5,  0.0, 1.2, -30.0, -90.0}, // right
+        { 0.0, -1.0, 1.2, -30.0, 180.0}, // back
+        {-0.5,  0.0, 1.2, -30.0,  90.0}, // left
+    };
+
+    std::vector<Slot> slots(n);
+    for (int i = 0; i < n; ++i) {
+        slots[i].path = paths[i];
+        slots[i].src  = std::make_unique<FileSource>();
+        if (!slots[i].src->open(slots[i].path)) {
+            std::cerr << "[multi] failed to open source " << i << ": " << slots[i].path << "\n";
+            return 1;
+        }
+        slots[i].frame = slots[i].src->nextFrame();
+        if (!slots[i].frame.data) {
+            std::cerr << "[multi] failed to get first frame for source " << i << "\n";
+            return 1;
+        }
+        slots[i].params = (i < 4) ? kDirectionDefaults[i] : SlotParams{};
+    }
+
+    // Shared BEV canvas size — slot 0's first-frame dimensions, fixed for
+    // the whole run regardless of any individual slot's native resolution.
+    // Each slot's homography is rebuilt from THAT slot's own frame
+    // width/height every time (see rebuild_slot below); upload_nv12()
+    // already re-specifies texture size on every call, so a live path-swap
+    // to a differently-sized video needs no texture-reallocation logic.
+    int canvas_w      = slots[0].frame.width;
+    int canvas_h      = slots[0].frame.height;
+    int canvas_stride = slots[0].frame.stride;
+
+    GpuRenderer renderer;
+    if (!renderer.init_multi(egl, canvas_w, canvas_h, canvas_stride, n)) return 1;
+
+    double px_per_m = initial_px_per_m;
+
+    // Rebuilds one slot's homography from its current params + current
+    // frame's own width/height, and re-uploads it. Cheap — only called on
+    // a keypress (or a path-swap commit) for the one changed slot, never
+    // per rendered frame.
+    auto rebuild_slot = [&](int i, const char *changed) {
+        const DmaBufFrame &f = slots[i].frame;
+        const SlotParams  &p = slots[i].params;
+        mat3 K = build_intrinsics(f.width, f.height);
+        mat3 H = ground_to_image_H(p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw, K,
+                                   f.width, f.height, px_per_m,
+                                   canvas_w, canvas_h);
+        float Hf[9];
+        H.to_floats(Hf);
+        renderer.set_ipm_multi(i, Hf, (float)facing_deg_from_yaw(p.yaw));
+        std::printf("[multi] slot %d %-10s cam_x=%.2fm cam_y=%.2fm h=%.2fm "
+                    "pitch=%.1fdeg yaw=%.1fdeg (facing %.0fdeg)\n",
+                    i + 1, changed, p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw,
+                    facing_deg_from_yaw(p.yaw));
+    };
+    auto rebuild_all = [&](const char *changed) {
+        for (int i = 0; i < n; ++i) rebuild_slot(i, changed);
+    };
+
+    rebuild_all("init");
+
+    enable_raw_stdin();
+    int         active_slot  = 0;
+    float       overlap_deg  = 60.0f; // degrees, angular half-width (see BEV_ALGORITHM.md)
+    float       blend_edge   = 0.45f;
+    bool        in_path_edit = false;
+    std::string path_buf;
+    renderer.set_stitch_overlap(overlap_deg);
+    renderer.set_blend_edge(blend_edge);
+    renderer.set_px_per_m((float)px_per_m);
+
+    std::printf("[multi] %d source(s) loaded\n", n);
+    std::printf(
+        "[keys] s=snapshot  +/-=overlap(deg)  [/]=sharpness  c=sanity-check  "
+        "1..%d=select slot  E=edit path\n"
+        "       H/h=height+-  P/p=pitch+-  Y/y=yaw+-  G/g=cam_y+-  X/x=cam_x+-  "
+        "M/m=px_per_m+- (global)  Ctrl+C=stop\n", n);
+
+    uint64_t total_frames = 0;
+    double   next_due     = now_ms();
+
+    auto loop_on_eos = [](Slot &slot) {
+        slot.frame = slot.src->nextFrame();
+        if (!slot.frame.data) {
+            std::printf("[multi] EOS — looping %s\n", slot.path.c_str());
+            slot.src->close();
+            if (slot.src->open(slot.path)) slot.frame = slot.src->nextFrame();
+        }
+    };
+    auto frames_valid = [&]() {
+        for (auto &s : slots) if (!s.frame.data) return false;
+        return true;
+    };
+
+    std::vector<DmaBufFrame> frames(n);
+
+    while (g_running && frames_valid()) {
+        for (int i = 0; i < n; ++i) frames[i] = slots[i].frame;
+        renderer.render_frame_multi(frames);
+        ++total_frames;
+
+#ifdef HAVE_WAYLAND_PREVIEW
+        if (preview) {
+            preview->pump_events();
+            preview->present(renderer.fbo_texture(), renderer.width(), renderer.height());
+            if (!preview->running()) g_running = 0;
+            pace_to_framerate(next_due, slots[0].src->frame_duration_ms());
+        }
+#endif
+
+        char key = 0;
+        if (read(STDIN_FILENO, &key, 1) == 1) {
+            if (in_path_edit) {
+                // Text-entry mode: ECHO is off in raw mode (enable_raw_stdin()),
+                // so every printable byte is echoed back manually.
+                if (key == '\r' || key == '\n') {
+                    // Open-before-close: a bad path must never kill a
+                    // working slot.
+                    auto new_src = std::make_unique<FileSource>();
+                    if (new_src->open(path_buf)) {
+                        slots[active_slot].src->close();
+                        slots[active_slot].src   = std::move(new_src);
+                        slots[active_slot].path  = path_buf;
+                        slots[active_slot].frame = slots[active_slot].src->nextFrame();
+                        rebuild_slot(active_slot, "path");
+                        std::printf("\n[multi] slot %d path -> %s\n",
+                                    active_slot + 1, path_buf.c_str());
+                    } else {
+                        std::printf("\n[multi] failed to open '%s' — keeping previous source\n",
+                                    path_buf.c_str());
+                    }
+                    in_path_edit = false;
+                } else if (key == 0x1b) {
+                    std::printf("\n[multi] path edit cancelled\n");
+                    in_path_edit = false;
+                } else if (key == 0x7f || key == 0x08) {
+                    if (!path_buf.empty()) {
+                        path_buf.pop_back();
+                        std::fputs("\b \b", stdout);
+                        std::fflush(stdout);
+                    }
+                } else if (key >= 0x20 && key < 0x7f) {
+                    path_buf += key;
+                    std::fputc(key, stdout);
+                    std::fflush(stdout);
+                }
+            } else if (key == 's' || key == 'S') {
+                static int snap_idx = 0;
+                char snap_path[64];
+                std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
+                renderer.save_snapshot(snap_path);
+            } else if (key == '+' || key == '=') {
+                overlap_deg = std::min(overlap_deg + 5.0f, 180.0f);
+                renderer.set_stitch_overlap(overlap_deg);
+                std::printf("[multi] overlap(deg)=%.0f edge=%.2f\n", overlap_deg, blend_edge);
+            } else if (key == '-') {
+                overlap_deg = std::max(overlap_deg - 5.0f, 1.0f);
+                renderer.set_stitch_overlap(overlap_deg);
+                std::printf("[multi] overlap(deg)=%.0f edge=%.2f\n", overlap_deg, blend_edge);
+            } else if (key == ']') {
+                blend_edge = std::min(blend_edge + 0.01f, 0.49f);
+                renderer.set_blend_edge(blend_edge);
+                std::printf("[multi] overlap(deg)=%.0f edge=%.2f\n", overlap_deg, blend_edge);
+            } else if (key == '[') {
+                blend_edge = std::max(blend_edge - 0.01f, 0.0f);
+                renderer.set_blend_edge(blend_edge);
+                std::printf("[multi] overlap(deg)=%.0f edge=%.2f\n", overlap_deg, blend_edge);
+            } else if (key == 'c') {
+                for (int i = 0; i < n; ++i) {
+                    const DmaBufFrame &f = slots[i].frame;
+                    const SlotParams  &p = slots[i].params;
+                    mat3 K = build_intrinsics(f.width, f.height);
+                    mat3 H = ground_to_image_H(p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw, K,
+                                               f.width, f.height, px_per_m, canvas_w, canvas_h);
+                    char label[16];
+                    std::snprintf(label, sizeof(label), "slot%d", i + 1);
+                    ipm_debug_check(H, canvas_w, canvas_h, label);
+                }
+            } else if (key == 'M') {
+                px_per_m = std::min(px_per_m + 5.0, 500.0);
+                renderer.set_px_per_m((float)px_per_m);
+                rebuild_all("px_per_m+");
+            } else if (key == 'm') {
+                px_per_m = std::max(px_per_m - 5.0, 10.0);
+                renderer.set_px_per_m((float)px_per_m);
+                rebuild_all("px_per_m-");
+            } else if (key == 'E' || key == 'e') {
+                in_path_edit = true;
+                path_buf.clear();
+                std::printf("\n[multi] editing slot %d path (current: %s) — "
+                            "type new path, Enter=commit, Esc=cancel:\n> ",
+                            active_slot + 1, slots[active_slot].path.c_str());
+                std::fflush(stdout);
+            } else if (key >= '1' && key <= '9') {
+                int idx = key - '1';
+                if (idx < n) {
+                    active_slot = idx;
+                    std::printf("[multi] active slot -> %d (%s)\n",
+                                active_slot + 1, slots[active_slot].path.c_str());
+                } else {
+                    std::printf("[multi] slot %d doesn't exist (only %d loaded)\n", idx + 1, n);
+                }
+            } else if (key == 'H') {
+                slots[active_slot].params.cam_h = std::min(slots[active_slot].params.cam_h + 0.05, 3.0);
+                rebuild_slot(active_slot, "height+");
+            } else if (key == 'h') {
+                slots[active_slot].params.cam_h = std::max(slots[active_slot].params.cam_h - 0.05, 0.2);
+                rebuild_slot(active_slot, "height-");
+            } else if (key == 'P') {
+                slots[active_slot].params.pitch = std::min(slots[active_slot].params.pitch + 1.0, -1.0);
+                rebuild_slot(active_slot, "pitch+");
+            } else if (key == 'p') {
+                slots[active_slot].params.pitch = std::max(slots[active_slot].params.pitch - 1.0, -89.0);
+                rebuild_slot(active_slot, "pitch-");
+            } else if (key == 'Y') {
+                slots[active_slot].params.yaw = std::fmod(slots[active_slot].params.yaw + 1.0, 360.0);
+                rebuild_slot(active_slot, "yaw+");
+            } else if (key == 'y') {
+                slots[active_slot].params.yaw = std::fmod(slots[active_slot].params.yaw - 1.0 + 360.0, 360.0);
+                rebuild_slot(active_slot, "yaw-");
+            } else if (key == 'G') {
+                slots[active_slot].params.cam_y = std::min(slots[active_slot].params.cam_y + 0.05, 5.0);
+                rebuild_slot(active_slot, "cam_y+");
+            } else if (key == 'g') {
+                slots[active_slot].params.cam_y = std::max(slots[active_slot].params.cam_y - 0.05, -5.0);
+                rebuild_slot(active_slot, "cam_y-");
+            } else if (key == 'X') {
+                slots[active_slot].params.cam_x = std::min(slots[active_slot].params.cam_x + 0.05, 5.0);
+                rebuild_slot(active_slot, "cam_x+");
+            } else if (key == 'x') {
+                slots[active_slot].params.cam_x = std::max(slots[active_slot].params.cam_x - 0.05, -5.0);
+                rebuild_slot(active_slot, "cam_x-");
+            }
+        }
+
+        for (int i = 0; i < n; ++i) loop_on_eos(slots[i]);
+    }
+
+    std::printf("[loop] multi mode stopped after %llu frames\n",
+                (unsigned long long)total_frames);
+    restore_stdin();
+    renderer.cleanup();
+    return 0;
+}
+
 // ── Camera mode ───────────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[])
@@ -416,6 +707,7 @@ int main(int argc, char *argv[])
     const char *file_path  = nullptr;
     const char *file_left  = nullptr;
     const char *file_right = nullptr;
+    std::vector<std::string> sources;  // --src, repeatable; N-camera surround mode
     IpmParams   ipm;
     bool        preview_requested = false;
     bool        bev_requested     = false;
@@ -424,6 +716,7 @@ int main(int argc, char *argv[])
         if (a == "--file"            && i + 1 < argc) file_path  = argv[++i];
         else if (a == "--file-left"  && i + 1 < argc) file_left  = argv[++i];
         else if (a == "--file-right" && i + 1 < argc) file_right = argv[++i];
+        else if (a == "--src"        && i + 1 < argc) sources.push_back(argv[++i]);
         else if (a == "--preview") preview_requested = true;
         else if (a == "--bev") bev_requested = true;
         else if (a == "--baseline"   && i + 1 < argc) ipm.baseline = std::atof(argv[++i]);
@@ -432,6 +725,11 @@ int main(int argc, char *argv[])
         else if (a == "--yaw"        && i + 1 < argc) ipm.yaw      = std::atof(argv[++i]);
         else if (a == "--cam-y"      && i + 1 < argc) ipm.cam_y    = std::atof(argv[++i]);
         else if (a == "--px-per-m"   && i + 1 < argc) ipm.px_per_m = std::atof(argv[++i]);
+    }
+    if ((int)sources.size() > GpuRenderer::kMaxCameras) {
+        std::cerr << "[multi] " << sources.size() << " --src sources requested, "
+                     "max is " << GpuRenderer::kMaxCameras << "\n";
+        return 1;
     }
 
     // Declared before everything else so it's the LAST thing torn down at
@@ -477,6 +775,11 @@ int main(int argc, char *argv[])
     }
     std::cout << "[egl] context ready\n\n";
 
+    if (!sources.empty()) {
+        int rc = run_multi_file_mode(sources, active_egl, preview_ptr, ipm.px_per_m);
+        teardown_egl(egl);
+        return rc;
+    }
     if (file_left && file_right) {
         int rc = run_dual_file_mode(file_left, file_right, active_egl, preview_ptr, ipm);
         teardown_egl(egl);
