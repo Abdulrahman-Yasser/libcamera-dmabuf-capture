@@ -17,24 +17,26 @@ BevConfig bev_config_defaults()
     // facing_deg=90 (front), not the 90-degree-apart front/right split this
     // template originally assumed. Slots 2/3 are still-unused placeholders
     // for a future back/left camera pair.
-    // Recalibrated from captures/20260623_100123's camA.png/camB.png (a
-    // single shared ChArUco board shot, both cameras, not moved between
+    // Recalibrated from street_captures/20260623_101549's camA.png/camB.png
+    // (a single shared ChArUco board shot, both cameras, not moved between
     // frames) via cv2.findHomography(board-metres -> image-pixels) per
     // camera, RANSAC, then rescaled from that capture's 1640x1232 into the
     // 3280x2464 CAL_W/CAL_H space main.cpp's measured_H() assumes (see its
     // comment -- must match the resolution the board was shot at, not the
-    // runtime video's own size). 21 shared corners: median=0.77mm,
-    // mean=0.86mm, max=2.42mm overlap alignment error -- replaces an
-    // earlier pair of hb2i values that, while each individually plausible,
-    // didn't share a common board position with each other and produced a
-    // large, visible camA/camB mismatch in the rendered overlap band.
+    // runtime video's own size). 10 shared corners: median=1.36mm,
+    // mean=1.30mm, max=2.16mm overlap alignment error. Supersedes an earlier
+    // pair recalibrated the same way from captures/20260623_100123 (indoor;
+    // median=0.77mm/mean=0.86mm/max=2.42mm) -- swap back to that pair if
+    // testing indoors again, see BUGS_FOUND.md bug #3 for how these are
+    // derived and why they must come from one shared shot, not independently
+    // plausible ones.
     cfg.slots[0] = BevSlotConfig{
         -0.095, 0.0, 0.45, -30.0, 15.0, 90.0, true,
-        mat3{{ -3081.986, -135.1398, -0.1623139, 1576.966, 657.943, 1.077301, 1729.896, 1869.204, 1 }}
+        mat3{{ 381.189, -1179.514, 0.7100417, 3255.635, 94.37832, 0.2794913, -757.7147, 1378.566, 1 }}
     };
     cfg.slots[1] = BevSlotConfig{
         0.095, 0.0, 0.45, -30.0, -15.0, 90.0, true,
-        mat3{{ -2520.185, 298.7253, 0.3775643, 2816.847, 798.551, 1.133288, 3326.267, 2178.929, 1 }}
+        mat3{{ 1806.655, -760.9841, 0.5571218, 1630.012, 97.27809, -0.281527, 1891.094, 1240.923, 1 }}
     };
     cfg.slots[2] = BevSlotConfig{ 0.0, -1.0, 1.2, -30.0, 180.0, 270.0, false, mat3{} };
     cfg.slots[3] = BevSlotConfig{ -0.5, 0.0, 1.2, -30.0,  90.0, 180.0, false, mat3{} };
