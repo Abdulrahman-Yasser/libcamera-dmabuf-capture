@@ -81,6 +81,7 @@ add_executable(libcamera-dmabuf-capture
     dmabuf_import.cpp
     file_source.cpp
     ipm.cpp
+    bev_config.cpp
 )
 
 if (HAVE_WAYLAND_PREVIEW)

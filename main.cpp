@@ -4,6 +4,7 @@
 #include "file_source.h"
 #include "perf_timer.h"
 #include "ipm.h"
+#include "bev_config.h"
 #ifdef HAVE_WAYLAND_PREVIEW
 #include "wayland_window.h"
 #endif
@@ -28,6 +29,54 @@
 #include <unistd.h>
 
 using namespace libcamera;
+
+// Drop-in for ground_to_image_H() when the pose is measured, not tuned.
+// Reuses the same BEV-pixel -> ground mapping M; board centre (0.27,0.36 m)
+// is offset to the canvas centre so it renders centred.
+//
+// dx/dy/dyaw_deg let a calibrated (has_hb2i) slot still be live-tuned: they
+// are this slot's cam_x/cam_y/yaw *delta* away from the pose the ChArUco
+// shot was taken at (0 = untouched, reproduces the original fixed-Hb2i
+// behavior exactly). A ground-plane position+heading offset is the only
+// thing that can be validly composed on top of an opaque, already-
+// calibrated Hb2i -- cam_h/pitch are baked into Hb2i itself (the camera's
+// actual height/tilt when the board was shot) and can't be recovered or
+// re-applied without decomposing Hb2i back into K/R/t, so those two knobs
+// are intentionally inert for calibrated slots (see the H/h/P/p keyboard
+// handlers' warning below).
+// Resolution the ChArUco board->image homographies (kHb2i_A/kHb2i_B in
+// bev_config.cpp's bev_config_defaults()) were actually measured at --
+// fixed, independent of img_w/img_h below (the runtime video's own frame
+// size), which can be a different resolution entirely. Hb2i's raw output is
+// in calibration-image pixels, so normalizing by anything other than the
+// resolution it was measured at would silently rescale the homography.
+static constexpr double CAL_W = 3280.0, CAL_H = 2464.0;
+
+static mat3 measured_H(const mat3 &Hb2i, int img_w, int img_h,
+                       double px_per_m, int bev_w, int bev_h,
+                       double dx = 0.0, double dy = 0.0, double dyaw_deg = 0.0) {
+    (void)img_w; (void)img_h; // kept for call-site compatibility; see CAL_W/CAL_H above
+    const double r = px_per_m;
+    const double Xc = 0.27, Yc = 0.36;
+    mat3 S;
+    S.at(0,0)= 1.0/r; S.at(0,1)= 0.0;   S.at(0,2)= -(bev_w/2.0)/r + Xc;
+    S.at(1,0)= 0.0;   S.at(1,1)=-1.0/r; S.at(1,2)=  (bev_h/2.0)/r + Yc;
+    S.at(2,0)= 0.0;   S.at(2,1)= 0.0;   S.at(2,2)= 1.0;
+
+    // Rigid transform in board-metre space: rotate by dyaw about the board
+    // origin, then translate by (dx,dy). Identity when untouched, so an
+    // un-tuned slot renders exactly as before this fix.
+    const double rad = dyaw_deg * M_PI / 180.0;
+    const double ca = std::cos(rad), sa = std::sin(rad);
+    mat3 T;
+    T.at(0,0)= ca; T.at(0,1)=-sa; T.at(0,2)= dx;
+    T.at(1,0)= sa; T.at(1,1)= ca; T.at(1,2)= dy;
+    T.at(2,0)= 0;  T.at(2,1)=  0; T.at(2,2)= 1;
+
+    mat3 H = Hb2i * T * S;
+    for (int col = 0; col < 3; ++col) { H.at(0,col) /= CAL_W; H.at(1,col) /= CAL_H; }
+    return H;
+}
 
 // Points at the active WaylandPreviewWindow, or null when --preview wasn't
 // requested / this build has no preview support. Kept as a plain type alias
@@ -423,38 +472,41 @@ struct Slot {
     DmaBufFrame                 frame;
 };
 
-// Facing bearing (degrees, world atan2(Y,X) convention) that a camera at
-// this yaw points at — see BEV_ALGORITHM.md. Verified against
-// build_rotation(): yaw=0 -> 90 (+Y/front), yaw=-90 -> 0 (+X/right),
-// yaw=180 -> 270 (-Y/back), yaw=90 -> 180 (-X/left).
-static double facing_deg_from_yaw(double yaw_deg)
-{
-    double f = std::fmod(90.0 + yaw_deg, 360.0);
-    if (f < 0.0) f += 360.0;
-    return f;
-}
+// Which N-camera blend backend to use -- Feather is kFS_MULTI's existing
+// single-pass angular-weighted blend, Pyramid is the multi-band Laplacian
+// pyramid blend (GpuRenderer::init_multi_pyramid() et al.), a separate,
+// comparable alternative selected via --blend pyramid. Both share the same
+// slot setup/keyboard loop below; only init/per-slot-setter/render differ.
+enum class BlendMode { Feather, Pyramid };
 
 static int run_multi_file_mode(const std::vector<std::string> &paths,
                                const EGLState &egl, PreviewWindowPtr preview,
-                               double initial_px_per_m)
+                               double cli_px_per_m, bool px_per_m_from_cli,
+                               BlendMode blend_mode, const std::string &config_path)
 {
     int n = (int)paths.size();
-    if (n < 1 || n > GpuRenderer::kMaxCameras) {
+    int max_cams = (blend_mode == BlendMode::Pyramid)
+                   ? GpuRenderer::kPyramidMaxCameras : GpuRenderer::kMaxCameras;
+    if (n < 1 || n > max_cams) {
         std::cerr << "[multi] " << n << " sources requested, must be 1.."
-                  << GpuRenderer::kMaxCameras << "\n";
+                  << max_cams
+                  << (blend_mode == BlendMode::Pyramid ? " (pyramid blend mode's lower cap)\n" : "\n");
         return 1;
     }
 
-    // Direction defaults for the first 4 slots (front/right/back/left);
-    // slot 5+ gets neutral defaults (SlotParams{}). cam_x/cam_y are
-    // illustrative starting mounting offsets, not physically authoritative
-    // — fully live-tunable via X/x and G/g.
-    static const SlotParams kDirectionDefaults[4] = {
-        { 0.0,  1.0, 1.2, -30.0,   0.0}, // front
-        { 0.5,  0.0, 1.2, -30.0, -90.0}, // right
-        { 0.0, -1.0, 1.2, -30.0, 180.0}, // back
-        {-0.5,  0.0, 1.2, -30.0,  90.0}, // left
-    };
+    BevConfig cfg;
+    if (!bev_config_load(config_path, cfg)) return 1;
+
+    // Measured ChArUco poses only cover slots 0/1 in the config (kMaxSlots'
+    // other entries are hand-tuned, has_hb2i=false) — extend the config
+    // (and kMaxSlots) before raising this cap if more measured-pose slots
+    // are ever needed.
+    if (n != 2 || !cfg.slots[0].has_hb2i || !cfg.slots[1].has_hb2i) {
+        std::cerr << "[multi] measured-homography path requires exactly 2 sources "
+                     "with hb2i configured for slot0/slot1 (got " << n
+                  << " source(s); check " << config_path << ")\n";
+        return 1;
+    }
 
     std::vector<Slot> slots(n);
     for (int i = 0; i < n; ++i) {
@@ -469,7 +521,12 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
             std::cerr << "[multi] failed to get first frame for source " << i << "\n";
             return 1;
         }
-        slots[i].params = (i < 4) ? kDirectionDefaults[i] : SlotParams{};
+        if (i < BevConfig::kMaxSlots) {
+            const BevSlotConfig &sc = cfg.slots[i];
+            slots[i].params = SlotParams{ sc.cam_x, sc.cam_y, sc.cam_h, sc.pitch, sc.yaw };
+        } else {
+            slots[i].params = SlotParams{};
+        }
     }
 
     // Shared BEV canvas size — slot 0's first-frame dimensions, fixed for
@@ -483,9 +540,14 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     int canvas_stride = slots[0].frame.stride;
 
     GpuRenderer renderer;
-    if (!renderer.init_multi(egl, canvas_w, canvas_h, canvas_stride, n)) return 1;
+    bool init_ok = (blend_mode == BlendMode::Pyramid)
+        ? renderer.init_multi_pyramid(egl, canvas_w, canvas_h, canvas_stride, n)
+        : renderer.init_multi(egl, canvas_w, canvas_h, canvas_stride, n);
+    if (!init_ok) return 1;
 
-    double px_per_m = initial_px_per_m;
+    // CLI --px-per-m wins if given; otherwise fall back to the config file's
+    // default (bev_config_defaults() if the file didn't specify one either).
+    double px_per_m = px_per_m_from_cli ? cli_px_per_m : cfg.px_per_m;
 
     // Rebuilds one slot's homography from its current params + current
     // frame's own width/height, and re-uploads it. Cheap — only called on
@@ -494,17 +556,34 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     auto rebuild_slot = [&](int i, const char *changed) {
         const DmaBufFrame &f = slots[i].frame;
         const SlotParams  &p = slots[i].params;
-        mat3 K = build_intrinsics(f.width, f.height);
-        mat3 H = ground_to_image_H(p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw, K,
-                                   f.width, f.height, px_per_m,
-                                   canvas_w, canvas_h);
+        // Deltas from this slot's as-loaded (calibration-time) pose -- see
+        // measured_H()'s comment for why only cam_x/cam_y/yaw can be
+        // live-tuned this way. Zero until the user actually touches
+        // X/x, G/g, or Y/y, so an untouched slot's projection is bit-for-bit
+        // the original fixed-Hb2i result.
+        double dx   = p.cam_x - cfg.slots[i].cam_x;
+        double dy   = p.cam_y - cfg.slots[i].cam_y;
+        double dyaw = p.yaw   - cfg.slots[i].yaw;
+        mat3 H = measured_H(cfg.slots[i].hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
+                            dx, dy, dyaw);
         float Hf[9];
         H.to_floats(Hf);
-        renderer.set_ipm_multi(i, Hf, (float)facing_deg_from_yaw(p.yaw));
+        // The blend coverage wedge (which canvas sector this camera is
+        // allowed to contribute to) is a fact of the physical mounting --
+        // its own facing_deg config field, not derived from yaw at all, so
+        // two cameras that are both basically front-facing (just nudged a
+        // few degrees left/right via yaw) both correctly claim the front
+        // sector instead of splitting 90 degrees apart. Live yaw-tuning
+        // reprojects content via dyaw above without moving this boundary.
+        float facing_deg = (float)cfg.slots[i].facing_deg;
+        if (blend_mode == BlendMode::Pyramid)
+            renderer.set_ipm_multi_pyramid(i, Hf, facing_deg);
+        else
+            renderer.set_ipm_multi(i, Hf, facing_deg);
         std::printf("[multi] slot %d %-10s cam_x=%.2fm cam_y=%.2fm h=%.2fm "
-                    "pitch=%.1fdeg yaw=%.1fdeg (facing %.0fdeg)\n",
+                    "pitch=%.1fdeg yaw=%.1fdeg (facing %.0fdeg, fixed)\n",
                     i + 1, changed, p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw,
-                    facing_deg_from_yaw(p.yaw));
+                    facing_deg);
     };
     auto rebuild_all = [&](const char *changed) {
         for (int i = 0; i < n; ++i) rebuild_slot(i, changed);
@@ -514,20 +593,23 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
 
     enable_raw_stdin();
     int         active_slot  = 0;
-    float       overlap_deg  = 60.0f; // degrees, angular half-width (see BEV_ALGORITHM.md)
-    float       blend_edge   = 0.45f;
+    float       overlap_deg  = cfg.overlap_deg; // degrees, angular half-width (see BEV_ALGORITHM.md)
+    float       blend_edge   = cfg.blend_edge;
     bool        in_path_edit = false;
+    bool        free_yaw     = false; // 'F' toggle -- see GpuRenderer::set_free_yaw()
     std::string path_buf;
     renderer.set_stitch_overlap(overlap_deg);
     renderer.set_blend_edge(blend_edge);
     renderer.set_px_per_m((float)px_per_m);
 
-    std::printf("[multi] %d source(s) loaded\n", n);
+    std::printf("[multi] %d source(s) loaded, blend=%s\n", n,
+                blend_mode == BlendMode::Pyramid ? "pyramid" : "feather");
     std::printf(
         "[keys] s=snapshot  +/-=overlap(deg)  [/]=sharpness  c=sanity-check  "
-        "1..%d=select slot  E=edit path\n"
+        "F=toggle free-yaw\n"
+        "       1..%d=select slot  E=edit path\n"
         "       H/h=height+-  P/p=pitch+-  Y/y=yaw+-  G/g=cam_y+-  X/x=cam_x+-  "
-        "M/m=px_per_m+- (global)  Ctrl+C=stop\n", n);
+        "M/m=px_per_m+- (global)  W=save as default  Ctrl+C=stop\n", n);
 
     uint64_t total_frames = 0;
     double   next_due     = now_ms();
@@ -549,7 +631,8 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
 
     while (g_running && frames_valid()) {
         for (int i = 0; i < n; ++i) frames[i] = slots[i].frame;
-        renderer.render_frame_multi(frames);
+        if (blend_mode == BlendMode::Pyramid) renderer.render_frame_multi_pyramid(frames);
+        else                                  renderer.render_frame_multi(frames);
         ++total_frames;
 
 #ifdef HAVE_WAYLAND_PREVIEW
@@ -603,7 +686,7 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                 std::snprintf(snap_path, sizeof(snap_path), "/tmp/snapshot_%03d.png", snap_idx++);
                 renderer.save_snapshot(snap_path);
             } else if (key == '+' || key == '=') {
-                overlap_deg = std::min(overlap_deg + 5.0f, 180.0f);
+                overlap_deg = std::min(overlap_deg + 5.0f, 360.0f);
                 renderer.set_stitch_overlap(overlap_deg);
                 std::printf("[multi] overlap(deg)=%.0f edge=%.2f\n", overlap_deg, blend_edge);
             } else if (key == '-') {
@@ -621,20 +704,50 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
             } else if (key == 'c') {
                 for (int i = 0; i < n; ++i) {
                     const DmaBufFrame &f = slots[i].frame;
-                    const SlotParams  &p = slots[i].params;
-                    mat3 K = build_intrinsics(f.width, f.height);
-                    mat3 H = ground_to_image_H(p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw, K,
-                                               f.width, f.height, px_per_m, canvas_w, canvas_h);
+                    const SlotParams &p = slots[i].params;
+                    mat3 H = measured_H(cfg.slots[i].hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
+                                        p.cam_x - cfg.slots[i].cam_x,
+                                        p.cam_y - cfg.slots[i].cam_y,
+                                        p.yaw   - cfg.slots[i].yaw);
                     char label[16];
                     std::snprintf(label, sizeof(label), "slot%d", i + 1);
                     ipm_debug_check(H, canvas_w, canvas_h, label);
                 }
+            } else if (key == 'F') {
+                free_yaw = !free_yaw;
+                renderer.set_free_yaw(free_yaw);
+                std::printf("[multi] free-yaw %s -- %s\n", free_yaw ? "ON" : "off",
+                            free_yaw ? "wedge cutoff disabled, content visible "
+                                       "anywhere its own homography is valid"
+                                     : "back to facing-sector-limited blending");
+            } else if (key == 'W') {
+                BevConfig save_cfg   = cfg; // keeps has_hb2i/hb2i + any slot>=n untouched
+                save_cfg.px_per_m    = px_per_m;
+                save_cfg.overlap_deg = overlap_deg;
+                save_cfg.blend_edge  = blend_edge;
+                for (int i = 0; i < n && i < BevConfig::kMaxSlots; ++i) {
+                    const SlotParams &p = slots[i].params;
+                    BevSlotConfig    &s = save_cfg.slots[i];
+                    s.cam_x = p.cam_x; s.cam_y = p.cam_y; s.cam_h = p.cam_h;
+                    s.pitch = p.pitch; s.yaw   = p.yaw;
+                }
+                if (bev_config_save(config_path, save_cfg)) {
+                    cfg = save_cfg;
+                    std::printf("[multi] saved current values as defaults -> %s\n",
+                                config_path.c_str());
+                }
             } else if (key == 'M') {
-                px_per_m = std::min(px_per_m + 5.0, 500.0);
+                // Cap was 500 -- nowhere near enough for a hand-held-board
+                // ChArUco calibration, whose valid ground span is much
+                // smaller than a car-scale rig's, so it needed a canvas
+                // representing thousands of px/m to not be mostly black
+                // (see the coverage-map investigation this fixed). Bigger
+                // step too, so tuning this doesn't take hundreds of presses.
+                px_per_m = std::min(px_per_m + 50.0, 10000.0);
                 renderer.set_px_per_m((float)px_per_m);
                 rebuild_all("px_per_m+");
             } else if (key == 'm') {
-                px_per_m = std::max(px_per_m - 5.0, 10.0);
+                px_per_m = std::max(px_per_m - 50.0, 10.0);
                 renderer.set_px_per_m((float)px_per_m);
                 rebuild_all("px_per_m-");
             } else if (key == 'E' || key == 'e') {
@@ -656,15 +769,27 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
             } else if (key == 'H') {
                 slots[active_slot].params.cam_h = std::min(slots[active_slot].params.cam_h + 0.05, 3.0);
                 rebuild_slot(active_slot, "height+");
+                if (cfg.slots[active_slot].has_hb2i)
+                    std::printf("[multi] note: cam_h is baked into slot %d's calibrated "
+                                "homography and has no visual effect here\n", active_slot + 1);
             } else if (key == 'h') {
                 slots[active_slot].params.cam_h = std::max(slots[active_slot].params.cam_h - 0.05, 0.2);
                 rebuild_slot(active_slot, "height-");
+                if (cfg.slots[active_slot].has_hb2i)
+                    std::printf("[multi] note: cam_h is baked into slot %d's calibrated "
+                                "homography and has no visual effect here\n", active_slot + 1);
             } else if (key == 'P') {
                 slots[active_slot].params.pitch = std::min(slots[active_slot].params.pitch + 1.0, -1.0);
                 rebuild_slot(active_slot, "pitch+");
+                if (cfg.slots[active_slot].has_hb2i)
+                    std::printf("[multi] note: pitch is baked into slot %d's calibrated "
+                                "homography and has no visual effect here\n", active_slot + 1);
             } else if (key == 'p') {
                 slots[active_slot].params.pitch = std::max(slots[active_slot].params.pitch - 1.0, -89.0);
                 rebuild_slot(active_slot, "pitch-");
+                if (cfg.slots[active_slot].has_hb2i)
+                    std::printf("[multi] note: pitch is baked into slot %d's calibrated "
+                                "homography and has no visual effect here\n", active_slot + 1);
             } else if (key == 'Y') {
                 slots[active_slot].params.yaw = std::fmod(slots[active_slot].params.yaw + 1.0, 360.0);
                 rebuild_slot(active_slot, "yaw+");
@@ -709,8 +834,18 @@ int main(int argc, char *argv[])
     const char *file_right = nullptr;
     std::vector<std::string> sources;  // --src, repeatable; N-camera surround mode
     IpmParams   ipm;
-    bool        preview_requested = false;
-    bool        bev_requested     = false;
+    bool        preview_requested  = false;
+    bool        bev_requested      = false;
+    // --src mode's per-slot pose/homography defaults live in a config file
+    // (see bev_config.h) instead of hardcoded arrays; --px-per-m still wins
+    // over the file's default when passed, hence tracking whether it was.
+    std::string config_path        = "bev_config.ini";
+    bool        px_per_m_from_cli  = false;
+    // --blend pyramid selects the multi-band Laplacian pyramid blend
+    // (GpuRenderer::init_multi_pyramid() et al.) instead of the default
+    // single-pass angular-weighted "feather" blend (kFS_MULTI) -- --src
+    // mode only, a separate/comparable alternative, not a replacement.
+    BlendMode   blend_mode = BlendMode::Feather;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--file"            && i + 1 < argc) file_path  = argv[++i];
@@ -719,17 +854,31 @@ int main(int argc, char *argv[])
         else if (a == "--src"        && i + 1 < argc) sources.push_back(argv[++i]);
         else if (a == "--preview") preview_requested = true;
         else if (a == "--bev") bev_requested = true;
+        else if (a == "--config"     && i + 1 < argc) config_path = argv[++i];
+        else if (a == "--blend"      && i + 1 < argc) {
+            std::string mode = argv[++i];
+            if (mode == "pyramid") blend_mode = BlendMode::Pyramid;
+            else if (mode == "feather") blend_mode = BlendMode::Feather;
+            else { std::cerr << "[multi] unknown --blend mode '" << mode << "' (use feather|pyramid)\n"; return 1; }
+        }
         else if (a == "--baseline"   && i + 1 < argc) ipm.baseline = std::atof(argv[++i]);
         else if (a == "--h"          && i + 1 < argc) ipm.cam_h    = std::atof(argv[++i]);
         else if (a == "--pitch"      && i + 1 < argc) ipm.pitch    = std::atof(argv[++i]);
         else if (a == "--yaw"        && i + 1 < argc) ipm.yaw      = std::atof(argv[++i]);
         else if (a == "--cam-y"      && i + 1 < argc) ipm.cam_y    = std::atof(argv[++i]);
-        else if (a == "--px-per-m"   && i + 1 < argc) ipm.px_per_m = std::atof(argv[++i]);
+        else if (a == "--px-per-m"   && i + 1 < argc) {
+            ipm.px_per_m      = std::atof(argv[++i]);
+            px_per_m_from_cli = true;
+        }
     }
-    if ((int)sources.size() > GpuRenderer::kMaxCameras) {
-        std::cerr << "[multi] " << sources.size() << " --src sources requested, "
-                     "max is " << GpuRenderer::kMaxCameras << "\n";
-        return 1;
+    {
+        int max_cams = (blend_mode == BlendMode::Pyramid)
+                       ? GpuRenderer::kPyramidMaxCameras : GpuRenderer::kMaxCameras;
+        if ((int)sources.size() > max_cams) {
+            std::cerr << "[multi] " << sources.size() << " --src sources requested, "
+                         "max is " << max_cams << "\n";
+            return 1;
+        }
     }
 
     // Declared before everything else so it's the LAST thing torn down at
@@ -776,7 +925,8 @@ int main(int argc, char *argv[])
     std::cout << "[egl] context ready\n\n";
 
     if (!sources.empty()) {
-        int rc = run_multi_file_mode(sources, active_egl, preview_ptr, ipm.px_per_m);
+        int rc = run_multi_file_mode(sources, active_egl, preview_ptr, ipm.px_per_m,
+                                     px_per_m_from_cli, blend_mode, config_path);
         teardown_egl(egl);
         return rc;
     }

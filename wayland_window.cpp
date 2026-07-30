@@ -177,7 +177,14 @@ class WlOutputHandler     : public wayland::client::CWlOutput<WlOutputHandler> {
 
 struct WaylandPreviewWindow::Impl {
     // ── Callbacks used by the CRTP handler templates ─────────────────────────
-    void OnXdgSurfaceConfigure(uint32_t /*serial*/) noexcept { configured_ = true; }
+    // ack_configure is required by the xdg-shell protocol (the compositor may
+    // withhold mapping the surface without it) -- agl-compositor tolerated
+    // its absence, but stock GNOME/mutter and weston do not.
+    void OnXdgSurfaceConfigure(uint32_t serial) noexcept
+    {
+        xdg_surface_.Get()->AckConfigure(serial);
+        configured_ = true;
+    }
 
     void OnToplevelConfigure(int32_t w, int32_t h) noexcept
     {
@@ -275,9 +282,9 @@ struct WaylandPreviewWindow::Impl {
             return false;
         }
         if (!agl_shell_name_) {
-            std::fprintf(stderr, "[preview] agl_shell not advertised "
-                                 "(not an AGL compositor?)\n");
-            return false;
+            std::printf("[preview] agl_shell not advertised (not an AGL "
+                        "compositor) — showing a regular top-level window "
+                        "instead of an agl_shell background surface\n");
         }
         if (!output_name_) {
             std::fprintf(stderr, "[preview] no wl_output advertised\n");
@@ -314,12 +321,14 @@ struct WaylandPreviewWindow::Impl {
             return false;
         }
 
-        if (!wl::BindHandler<agl_shell_traits>(registry_, agl_shell_,
-                                               agl_shell_name_, agl_shell_ver_)) {
-            std::fprintf(stderr, "[preview] agl_shell bind failed\n");
-            return false;
+        if (agl_shell_name_) {
+            if (!wl::BindHandler<agl_shell_traits>(registry_, agl_shell_,
+                                                   agl_shell_name_, agl_shell_ver_)) {
+                std::fprintf(stderr, "[preview] agl_shell bind failed\n");
+                return false;
+            }
+            agl_shell_.Get()->app_ = this;
         }
-        agl_shell_.Get()->app_ = this;
 
         if (!presentation_.Bind(registry_, this)) {
             std::fprintf(stderr, "[preview] wp_presentation bind failed\n");
@@ -330,6 +339,8 @@ struct WaylandPreviewWindow::Impl {
             std::fprintf(stderr, "[preview] timed out waiting for bind events\n");
             return false;
         }
+
+        if (!agl_shell_name_) return true; // no agl_shell to wait on
 
         if (bound_state_ == BoundState::Fail) return false;
         if (bound_state_ == BoundState::Waiting) {
@@ -378,12 +389,23 @@ struct WaylandPreviewWindow::Impl {
         xdg_toplevel_.Get()->SetTitle("libcamera-dmabuf-capture preview");
         xdg_toplevel_.Get()->SetAppId("org.agl.libcamera-dmabuf-capture-preview");
 
+        // Only for the plain-toplevel fallback (no agl_shell) — an agl_shell
+        // background surface already covers the whole output by definition,
+        // so requesting fullscreen on top of that role is redundant (and
+        // untested against agl-compositor); left as before on that path.
+        if (!agl_shell_name_)
+            xdg_toplevel_.Get()->SetFullscreen(output_.Get()->GetProxy());
+
         // Empty commit — establishes the xdg role in the committed state.
         // MUST precede set_background.
         surface_.Get()->Commit();
 
-        agl_shell_.Get()->SetBackground(surface_.Get()->GetProxy(), output_.Get()->GetProxy());
-        std::printf("[preview] background surface registered with agl_shell\n");
+        if (agl_shell_name_) {
+            agl_shell_.Get()->SetBackground(surface_.Get()->GetProxy(), output_.Get()->GetProxy());
+            std::printf("[preview] background surface registered with agl_shell\n");
+        } else {
+            std::printf("[preview] no agl_shell — showing as a regular top-level window\n");
+        }
 
         while (!configured_) {
             if (!wl::RoundtripWithTimeout(display_.Get())) {
@@ -393,8 +415,10 @@ struct WaylandPreviewWindow::Impl {
         }
         std::printf("[preview] xdg_surface configured (%dx%d)\n", width_, height_);
 
-        agl_shell_.Get()->Ready();
-        std::printf("[preview] agl_shell.ready sent\n");
+        if (agl_shell_name_) {
+            agl_shell_.Get()->Ready();
+            std::printf("[preview] agl_shell.ready sent\n");
+        }
         return true;
     }
 

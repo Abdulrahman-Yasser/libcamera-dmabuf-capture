@@ -100,10 +100,14 @@ void main() {
     bool okR = sR.z > 0.0 && all(greaterThanEqual(uvR, vec2(0.0)))
                           && all(lessThanEqual(uvR, vec2(1.0)));
 
-    // NV12 upload convention: source row 0 is the image top, but GL texture
-    // v=0 is the bottom — flip v to match (same convention as kFS/kFS_2D).
-    vec3 cL = nv12_to_rgb(uTexY0, uTexUV0, vec2(uvL.x, 1.0 - uvL.y));
-    vec3 cR = nv12_to_rgb(uTexY1, uTexUV1, vec2(uvR.x, 1.0 - uvR.y));
+    // No flip here, unlike kFS/kFS_2D's screen-position sampling: uvL/uvR
+    // come from the homography (ground_to_image_H()'s standard image-space
+    // math, v increasing downward), which already lands on uv.y=0 = image
+    // top -- the same row glTexImage2D's first uploaded row placed at GL's
+    // V=0. kFS_2D's "1.0-v" flip corrects a *different* mismatch (screen-
+    // space NDC vTexCoord vs. texture row order); it doesn't apply here.
+    vec3 cL = nv12_to_rgb(uTexY0, uTexUV0, uvL);
+    vec3 cR = nv12_to_rgb(uTexY1, uTexUV1, uvR);
 
     vec3 rgb;
     if (okL && okR) {
@@ -164,12 +168,14 @@ void main() {
     }
 
     // No flip here, unlike kFS/kFS_2D's screen-position sampling: `uv` comes
-    // from ground_to_image_H(), which already uses standard image-space math
-    // (cy = height/2, v increasing downward) — the same row-order convention
-    // the decoded NV12 buffer (and therefore this texture's v) already has.
-    // kFS_2D's "1.0 - v" flip corrects a *different* mismatch (NDC-derived
-    // vTexCoord vs. texture v have opposite polarity); it doesn't apply to a
-    // homography-derived uv, which already matches the texture directly.
+    // from ground_to_image_H(), which already uses standard image-space
+    // math (cy = height/2, v increasing downward) -- the same row-order
+    // convention the decoded NV12 buffer (and therefore this texture's v)
+    // already has: glTexImage2D's first uploaded row (the image top) lands
+    // at GL's V=0, and the homography's uv.y=0 means image top too, so they
+    // already agree. kFS_2D's "1.0-v" flip corrects a *different* mismatch
+    // (screen-space NDC vTexCoord vs. texture row order); it doesn't apply
+    // to a homography-derived uv, which already matches the texture directly.
     float Y  = texture(uTexY,  uv).r;
     vec2  UV = texture(uTexUV, uv).rg - 0.5;
     float R  = clamp(Y + 1.402  * UV.y,                0.0, 1.0);
@@ -235,6 +241,15 @@ uniform float uOverlap;
 // Controls sharpness of the crossover within the blend zone — identical
 // meaning/formula to kFS_DUAL's uBlendEdge.
 uniform float uBlendEdge;
+// Testing/exploration escape hatch: when > 0.5, every camera's blend weight
+// is forced to 1 (still gated by the real per-pixel "ok" validity check
+// below) instead of being shaped by facing/uOverlap/uBlendEdge at all -- so
+// a camera's content is visible everywhere its own homography validly maps
+// it, with no angular sector restricting where that's allowed to show up.
+// Physically dishonest for a real rig (two forward cameras can't actually
+// see behind themselves), but useful for freely sweeping yaw during testing
+// without fighting the coverage wedge. Off (0) by default.
+uniform float uFreeYaw;
 
 out vec4 fragColor;
 
@@ -255,17 +270,23 @@ const float kPi = 3.14159265358979;
         bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))         \
                             && all(lessThanEqual(uv, vec2(1.0)));           \
         if (ok) {                                                           \
-            /* Angular distance from this fragment's bearing to camera */   \
-            /* IDX's facing, wrapped to (-pi, pi]. */                       \
-            float d   = mod(thetaFrag - radians(uFacingDeg[IDX]) + kPi,     \
-                            2.0 * kPi) - kPi;                               \
-            float raw = clamp(1.0 - abs(d) / radians(uOverlap), 0.0, 1.0);  \
-            float w   = smoothstep(uBlendEdge, 1.0 - uBlendEdge, raw);      \
+            float w;                                                        \
+            if (uFreeYaw > 0.5) {                                           \
+                w = 1.0;                                                    \
+            } else {                                                        \
+                /* Angular distance from this fragment's bearing to camera */\
+                /* IDX's facing, wrapped to (-pi, pi]. */                   \
+                float d   = mod(thetaFrag - radians(uFacingDeg[IDX]) + kPi, \
+                                2.0 * kPi) - kPi;                           \
+                float raw = clamp(1.0 - abs(d) / radians(uOverlap), 0.0, 1.0);\
+                w = smoothstep(uBlendEdge, 1.0 - uBlendEdge, raw);          \
+            }                                                               \
             if (w > 0.0) {                                                  \
-                /* NV12->RGB; same upload-convention flip as kFS_DUAL. */   \
-                vec2 uv2 = vec2(uv.x, 1.0 - uv.y);                          \
-                float Y  = texture(uTexY[IDX],  uv2).r;                    \
-                vec2  UV = texture(uTexUV[IDX], uv2).rg - 0.5;              \
+                /* NV12->RGB. No v-flip: uv is homography-derived (see    */ \
+                /* kFS_BEV's comment) and already matches the texture's   */ \
+                /* row order directly.                                   */ \
+                float Y  = texture(uTexY[IDX],  uv).r;                     \
+                vec2  UV = texture(uTexUV[IDX], uv).rg - 0.5;               \
                 vec3  c  = vec3(                                            \
                     clamp(Y + 1.402  * UV.y,                0.0, 1.0),     \
                     clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0),     \
@@ -307,6 +328,215 @@ void main() {
     PROCESS_CAMERA(7)
 
     fragColor = vec4(weightSum > 0.0 ? colorSum / weightSum : vec3(0.0), 1.0);
+}
+)glsl";
+
+// ── Multi-band (Laplacian pyramid) blend, N-camera surround-view ───────────────
+//
+// Second, separate blend option for --src mode, alongside kFS_MULTI's
+// single-pass angular-weighted "feathering" blend above. Blends different
+// spatial-frequency bands with different-width blend zones instead of one
+// fixed width, so it can hide brightness/color seam mismatch feathering
+// cannot. Genuinely multi-pass: warp -> Gaussian pyramid -> Laplacian
+// pyramid -> per-level cross-camera blend -> reconstruct, five shaders below
+// used in that order by GpuRenderer::render_frame_multi_pyramid().
+//
+// Weight is packed into each pyramid texture's alpha channel alongside
+// color (RGBA16F, needed since Laplacian levels are difference images with
+// negative values, which GL_RGBA8 cannot store) -- so the Gaussian/Laplacian
+// pyramid decomposition of the per-camera blend-weight mask happens
+// automatically in lockstep with the color's, exactly matching Burt-Adelson
+// mask-pyramid treatment, with no separate mask texture or pass.
+
+// Pass 1/5: per-camera homography warp + angular blend weight, one draw per
+// camera (NOT one draw for all N like kFS_MULTI -- see GpuRenderer's
+// u_H_pyr_loc_ comment). Because of that, this shader takes a single uH/
+// uFacingDeg pair, not an array, so it needs none of kFS_MULTI's manual
+// unrolling -- ordinary sampler2D, no sampler array anywhere.
+static const char kFS_PYR_WARP[] = R"glsl(
+#version 300 es
+precision mediump float;
+
+uniform sampler2D uTexY;
+uniform sampler2D uTexUV;
+
+// BEV-pixel -> camera-image homography for THIS camera (see
+// ground_to_image_H() in ipm.cpp), same convention as kFS_MULTI/kFS_BEV.
+uniform mat3  uH;
+uniform float uFacingDeg;
+
+uniform float uBevWidth;
+uniform float uBevHeight;
+uniform float uPxPerM;
+uniform float uOverlap;     // angular half-width, degrees (kFS_MULTI's meaning)
+uniform float uBlendEdge;
+uniform float uFreeYaw;     // same testing escape hatch as kFS_MULTI's uFreeYaw
+
+out vec4 fragColor;
+
+const float kPi = 3.14159265358979;
+
+void main() {
+    vec3 p = vec3(gl_FragCoord.x, uBevHeight - gl_FragCoord.y, 1.0);
+    vec3 s = uH * p;
+    vec2 uv = s.xy / s.z;
+
+    bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))
+                        && all(lessThanEqual(uv, vec2(1.0)));
+    if (!ok) {
+        fragColor = vec4(0.0);   // weight 0 -> contributes nothing at any level
+        return;
+    }
+
+    float w;
+    if (uFreeYaw > 0.5) {
+        w = 1.0;
+    } else {
+        float worldX    = (gl_FragCoord.x - uBevWidth  * 0.5) / uPxPerM;
+        float worldY    = (gl_FragCoord.y - uBevHeight * 0.5) / uPxPerM;
+        float thetaFrag = atan(worldY, worldX);
+
+        float d   = mod(thetaFrag - radians(uFacingDeg) + kPi, 2.0 * kPi) - kPi;
+        float raw = clamp(1.0 - abs(d) / radians(uOverlap), 0.0, 1.0);
+        w = smoothstep(uBlendEdge, 1.0 - uBlendEdge, raw);
+    }
+
+    // No v-flip: uv is homography-derived (see kFS_BEV's comment) and
+    // already matches the texture's row order directly.
+    float Y  = texture(uTexY,  uv).r;
+    vec2  UV = texture(uTexUV, uv).rg - 0.5;
+    vec3  c  = vec3(
+        clamp(Y + 1.402  * UV.y,                0.0, 1.0),
+        clamp(Y - 0.344  * UV.x - 0.714 * UV.y, 0.0, 1.0),
+        clamp(Y + 1.772  * UV.x,                0.0, 1.0));
+
+    fragColor = vec4(c, w);
+}
+)glsl";
+
+// Pass 2/5: build one Gaussian pyramid level from the previous one -- fixed
+// 5x5 binomial-approximation blur ([1,4,6,4,1]/16 outer-producted) applied
+// to color+weight together (one vec4 fetch per tap), then implicitly
+// downsampled by rendering at half the source's viewport size. Single-pass,
+// non-separable (10 taps would be cheaper than 25 via two passes, but that
+// doubles this stage's draw-call count -- not worth it for a first cut at
+// this pass budget; a real profiling target if it's ever too slow).
+static const char kFS_PYR_DOWNSAMPLE[] = R"glsl(
+#version 300 es
+precision mediump float;
+
+uniform sampler2D uSrc;
+uniform vec2      uSrcTexelSize;   // 1/srcWidth, 1/srcHeight
+
+in  vec2 vTexCoord;
+out vec4 fragColor;
+
+void main() {
+    const float k[5] = float[5](1.0, 4.0, 6.0, 4.0, 1.0);
+    vec4  sum  = vec4(0.0);
+    float wsum = 0.0;
+    for (int j = -2; j <= 2; ++j) {
+        for (int i = -2; i <= 2; ++i) {
+            float wgt  = k[i + 2] * k[j + 2];
+            vec2  offs = vec2(float(i), float(j)) * uSrcTexelSize;
+            sum  += texture(uSrc, vTexCoord + offs) * wgt;
+            wsum += wgt;
+        }
+    }
+    fragColor = sum / wsum;
+}
+)glsl";
+
+// Pass 3/5: Laplacian (band-pass) level = this level's Gaussian minus the
+// next (coarser) level's Gaussian, upsampled back to this level's
+// resolution. Upsampling is just a plain texture() fetch of the smaller
+// source at this pass's (larger) destination resolution -- GL_LINEAR
+// bilinear filtering on the bound texture does the interpolation, no
+// separate upsample shader/pass needed. That level's weight (alpha, already
+// blurred/downsampled in lockstep with color by the pass above) carries
+// through unchanged.
+static const char kFS_PYR_LAPLACE[] = R"glsl(
+#version 300 es
+precision mediump float;
+
+uniform sampler2D uGaussCur;    // this level, full res at this level
+uniform sampler2D uGaussNext;   // next (coarser) level, half res -> upsampled by sampling here
+
+in  vec2 vTexCoord;
+out vec4 fragColor;
+
+void main() {
+    vec4 cur = texture(uGaussCur,  vTexCoord);
+    vec3 up  = texture(uGaussNext, vTexCoord).rgb;
+    fragColor = vec4(cur.rgb - up, cur.a);
+}
+)glsl";
+
+// Pass 4/5: cross-camera blend at one pyramid level -- reads ALL N cameras'
+// textures for that level in one draw, so (like kFS_MULTI) this is the one
+// shader in the pyramid pipeline that hits Mesa/V3D's "no variable index
+// into a sampler array" restriction, and needs the same manual-unroll fix.
+// MAX_PYR_CAMERAS must track GpuRenderer::kPyramidMaxCameras (same
+// hand-maintained-list caveat as kFS_MULTI's MAX_CAMERAS/PROCESS_CAMERA
+// list). Used for every level including the coarsest: at the coarsest level
+// the caller binds each camera's coarsest Gaussian (not Laplacian) texture
+// to uLevelTex[i], making this exactly kFS_MULTI's normalized weighted
+// average, evaluated once at low resolution -- not a coincidence.
+static const char kFS_PYR_BLEND[] = R"glsl(
+#version 300 es
+precision mediump float;
+
+#define MAX_PYR_CAMERAS 4
+
+uniform sampler2D uLevelTex[MAX_PYR_CAMERAS];
+uniform int       uNumCameras;
+
+in  vec2 vTexCoord;
+out vec4 fragColor;
+
+#define PROCESS_PYR_CAMERA(IDX)                             \
+    if (IDX < uNumCameras) {                                 \
+        vec4 t = texture(uLevelTex[IDX], vTexCoord);         \
+        colorSum  += t.rgb * t.a;                            \
+        weightSum += t.a;                                    \
+    }
+
+void main() {
+    vec3  colorSum  = vec3(0.0);
+    float weightSum = 0.0;
+
+    PROCESS_PYR_CAMERA(0)
+    PROCESS_PYR_CAMERA(1)
+    PROCESS_PYR_CAMERA(2)
+    PROCESS_PYR_CAMERA(3)
+
+    // No clamp -- blended Laplacian bands can be negative/out-of-[0,1];
+    // only the final reconstructed image (kFS_PYR_RECON's sum) represents
+    // actual display color.
+    fragColor = vec4(weightSum > 0.0 ? colorSum / weightSum : vec3(0.0), 1.0);
+}
+)glsl";
+
+// Pass 5/5: reconstruction -- this level's blended band plus the next
+// coarser level's already-reconstructed result, upsampled the same
+// bilinear-fetch way kFS_PYR_LAPLACE does. Run from the coarsest level
+// downward; the coarsest level itself needs no reconstruction pass (its
+// blended texture from kFS_PYR_BLEND already *is* that level's result) --
+// see render_frame_multi_pyramid()'s loop, which starts at level K-2.
+static const char kFS_PYR_RECON[] = R"glsl(
+#version 300 es
+precision mediump float;
+
+uniform sampler2D uBlended;      // this level's cross-camera-blended texture
+uniform sampler2D uPrevResult;   // next coarser level's reconstructed result
+
+in  vec2 vTexCoord;
+out vec4 fragColor;
+
+void main() {
+    vec3 blended = texture(uBlended,    vTexCoord).rgb;
+    vec3 prev    = texture(uPrevResult, vTexCoord).rgb;
+    fragColor = vec4(blended + prev, 1.0);
 }
 )glsl";
 
@@ -800,6 +1030,10 @@ void GpuRenderer::set_stitch_overlap(float v)
         glUseProgram(prog_multi_);
         glUniform1f(glGetUniformLocation(prog_multi_, "uOverlap"), v);
     }
+    if (prog_pyr_warp_) {
+        glUseProgram(prog_pyr_warp_);
+        glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uOverlap"), v);
+    }
 }
 
 void GpuRenderer::set_blend_edge(float v)
@@ -811,6 +1045,26 @@ void GpuRenderer::set_blend_edge(float v)
     if (prog_multi_) {
         glUseProgram(prog_multi_);
         glUniform1f(glGetUniformLocation(prog_multi_, "uBlendEdge"), v);
+    }
+    if (prog_pyr_warp_) {
+        glUseProgram(prog_pyr_warp_);
+        glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uBlendEdge"), v);
+    }
+}
+
+void GpuRenderer::set_free_yaw(bool on)
+{
+    // kFS_DUAL has no facing/wedge concept at all (its blend is a plain
+    // world-X seam), so there's nothing to bypass there -- multi/pyramid
+    // only.
+    float v = on ? 1.0f : 0.0f;
+    if (prog_multi_) {
+        glUseProgram(prog_multi_);
+        glUniform1f(glGetUniformLocation(prog_multi_, "uFreeYaw"), v);
+    }
+    if (prog_pyr_warp_) {
+        glUseProgram(prog_pyr_warp_);
+        glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uFreeYaw"), v);
     }
 }
 
@@ -831,6 +1085,10 @@ void GpuRenderer::set_px_per_m(float v)
     if (prog_multi_) {
         glUseProgram(prog_multi_);
         glUniform1f(glGetUniformLocation(prog_multi_, "uPxPerM"), v);
+    }
+    if (prog_pyr_warp_) {
+        glUseProgram(prog_pyr_warp_);
+        glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uPxPerM"), v);
     }
 }
 
@@ -904,6 +1162,7 @@ bool GpuRenderer::init_multi(const EGLState &egl, int w, int h, int stride, int 
     // tunable at runtime via set_stitch_overlap() (now in degrees).
     glUniform1f(glGetUniformLocation(prog_multi_, "uOverlap"),    60.0f);
     glUniform1f(glGetUniformLocation(prog_multi_, "uBlendEdge"), 0.45f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uFreeYaw"),    0.0f);
     // BEV canvas size — fixed for the lifetime of this renderer, matching
     // kFS_DUAL's uBevWidth/uBevHeight.
     glUniform1f(glGetUniformLocation(prog_multi_, "uBevWidth"),  (float)w);
@@ -951,6 +1210,272 @@ void GpuRenderer::render_frame_multi(const std::vector<DmaBufFrame> &frames)
 
     if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    glFlush();
+}
+
+bool GpuRenderer::init_multi_pyramid(const EGLState &egl, int w, int h, int stride,
+                                     int num_cameras, int num_levels)
+{
+    if (num_cameras < 1 || num_cameras > kPyramidMaxCameras) {
+        std::cerr << "[gpu] init_multi_pyramid: num_cameras=" << num_cameras
+                  << " out of range [1," << kPyramidMaxCameras << "]\n";
+        return false;
+    }
+    if (num_levels < 2 || num_levels > kPyramidLevels) {
+        std::cerr << "[gpu] init_multi_pyramid: num_levels=" << num_levels
+                  << " out of range [2," << kPyramidLevels << "]\n";
+        return false;
+    }
+
+    // Build the base single-file setup (FBO, tex_y_, tex_uv_, prog_2d_) --
+    // unused by pyramid mode, but every specialized init_*() delegates here
+    // for the shared FBO/viewport/timer-query setup, same as init_dual()/
+    // init_multi() already do.
+    if (!init(egl, w, h, stride)) return false;
+
+    // Real RGBA16F color-renderability probe at every resolution the
+    // pyramid will actually render to -- extension-string presence alone
+    // isn't trusted here (see kFS_MULTI's sampler-array-indexing comment:
+    // GLES spec-legal features don't always work on this driver).
+    {
+        int pw = w, ph = h;
+        for (int lvl = 0; lvl < num_levels; ++lvl) {
+            GLuint probe_tex = 0, probe_fbo = 0;
+            glGenTextures(1, &probe_tex);
+            glBindTexture(GL_TEXTURE_2D, probe_tex);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, pw, ph, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+            glGenFramebuffers(1, &probe_fbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, probe_fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, probe_tex, 0);
+            GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+            glDeleteFramebuffers(1, &probe_fbo);
+            glDeleteTextures(1, &probe_tex);
+            if (status != GL_FRAMEBUFFER_COMPLETE) {
+                const char *gl_exts = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+                bool has_half = gl_exts && std::strstr(gl_exts, "GL_EXT_color_buffer_half_float");
+                bool has_full = gl_exts && std::strstr(gl_exts, "GL_EXT_color_buffer_float");
+                std::cerr << "[gpu] init_multi_pyramid: GL_RGBA16F is not color-renderable "
+                             "at level " << lvl << " (" << pw << "x" << ph << "), "
+                             "glCheckFramebufferStatus()=0x" << std::hex << status << std::dec
+                          << ". GL_EXT_color_buffer_half_float=" << has_half
+                          << " GL_EXT_color_buffer_float=" << has_full
+                          << ". No RGBA8 fallback is implemented in this build -- "
+                             "use the feather-blend (--src without --blend) mode instead.\n";
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+                return false;
+            }
+            pw = std::max(1, pw / 2);
+            ph = std::max(1, ph / 2);
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    }
+
+    double t0 = now_ms();
+    prog_pyr_warp_       = build_program(kVS, kFS_PYR_WARP);
+    prog_pyr_downsample_ = build_program(kVS, kFS_PYR_DOWNSAMPLE);
+    prog_pyr_laplace_    = build_program(kVS, kFS_PYR_LAPLACE);
+    prog_pyr_blend_      = build_program(kVS, kFS_PYR_BLEND);
+    prog_pyr_recon_      = build_program(kVS, kFS_PYR_RECON);
+    if (!prog_pyr_warp_ || !prog_pyr_downsample_ || !prog_pyr_laplace_ ||
+        !prog_pyr_blend_ || !prog_pyr_recon_)
+        return false;
+    std::printf("[gpu] pyramid (%d-camera, %d-level) shaders compile+link : %.1f ms\n",
+                num_cameras, num_levels, now_ms() - t0);
+
+    // Fixed uniform assignments -- set once here, never touched again
+    // (unlike u_H_pyr_loc_/u_facing_pyr_loc_/u_pyr_texel_loc_ below, whose
+    // VALUES vary per camera/level every frame).
+    glUseProgram(prog_pyr_warp_);
+    glUniform1i(glGetUniformLocation(prog_pyr_warp_, "uTexY"),  0);
+    glUniform1i(glGetUniformLocation(prog_pyr_warp_, "uTexUV"), 1);
+    glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uOverlap"),    60.0f);
+    glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uBlendEdge"), 0.45f);
+    glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uFreeYaw"),    0.0f);
+    glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uBevWidth"),  (float)w);
+    glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uBevHeight"), (float)h);
+    glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uPxPerM"),    100.0f);
+    u_H_pyr_loc_      = glGetUniformLocation(prog_pyr_warp_, "uH");
+    u_facing_pyr_loc_ = glGetUniformLocation(prog_pyr_warp_, "uFacingDeg");
+
+    glUseProgram(prog_pyr_downsample_);
+    glUniform1i(glGetUniformLocation(prog_pyr_downsample_, "uSrc"), 0);
+    u_pyr_texel_loc_ = glGetUniformLocation(prog_pyr_downsample_, "uSrcTexelSize");
+
+    glUseProgram(prog_pyr_laplace_);
+    glUniform1i(glGetUniformLocation(prog_pyr_laplace_, "uGaussCur"),  0);
+    glUniform1i(glGetUniformLocation(prog_pyr_laplace_, "uGaussNext"), 1);
+
+    glUseProgram(prog_pyr_blend_);
+    char name[32];
+    for (int i = 0; i < num_cameras; ++i) {
+        std::snprintf(name, sizeof(name), "uLevelTex[%d]", i);
+        glUniform1i(glGetUniformLocation(prog_pyr_blend_, name), i);
+    }
+    glUniform1i(glGetUniformLocation(prog_pyr_blend_, "uNumCameras"), num_cameras);
+
+    glUseProgram(prog_pyr_recon_);
+    glUniform1i(glGetUniformLocation(prog_pyr_recon_, "uBlended"),    0);
+    glUniform1i(glGetUniformLocation(prog_pyr_recon_, "uPrevResult"), 1);
+
+    // ── Textures/FBO ────────────────────────────────────────────────────────
+    glGenFramebuffers(1, &fbo_pyr_);
+
+    auto make_tex = [](GLuint &t) {
+        glGenTextures(1, &t);
+        glBindTexture(GL_TEXTURE_2D, t);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    };
+    auto make_pyr_tex = [&](GLuint &t, int tw, int th) {
+        make_tex(t);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tw, th, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+    };
+
+    for (int i = 0; i < num_cameras; ++i) {
+        make_tex(tex_y_pyr_[i]);
+        make_tex(tex_uv_pyr_[i]);
+    }
+
+    int lw = w, lh = h;
+    for (int lvl = 0; lvl < num_levels; ++lvl) {
+        for (int i = 0; i < num_cameras; ++i)
+            make_pyr_tex(tex_pyr_gauss_[i][lvl], lw, lh);
+        if (lvl < num_levels - 1)
+            for (int i = 0; i < num_cameras; ++i)
+                make_pyr_tex(tex_pyr_lap_[i][lvl], lw, lh);
+        make_pyr_tex(tex_pyr_blended_[lvl], lw, lh);
+        // Level 0's reconstruction writes straight to fbo_tex_ (see
+        // render_frame_multi_pyramid()) and the coarsest level needs no
+        // reconstruction pass at all -- only intermediate levels need their
+        // own result texture.
+        if (lvl > 0 && lvl < num_levels - 1)
+            make_pyr_tex(tex_pyr_result_[lvl], lw, lh);
+        lw = std::max(1, lw / 2);
+        lh = std::max(1, lh / 2);
+    }
+
+    num_cameras_multi_pyramid_ = num_cameras;
+    num_levels_multi_pyramid_  = num_levels;
+    std::printf("[gpu] renderer ready (%d-camera, %d-level pyramid surround mode): %dx%d\n",
+                num_cameras, num_levels, W_, H_);
+    return true;
+}
+
+void GpuRenderer::set_ipm_multi_pyramid(int slot, const float H[9], float facing_deg)
+{
+    if (!prog_pyr_warp_ || slot < 0 || slot >= num_cameras_multi_pyramid_) return;
+    // No GL calls here -- the actual glUniform upload happens per-camera
+    // inside render_frame_multi_pyramid()'s warp pass, since prog_pyr_warp_
+    // draws one camera at a time and reuses the same uH/uFacingDeg location
+    // for each (see gpu_renderer.h's u_H_pyr_loc_ comment).
+    std::memcpy(H_pyr_[slot], H, sizeof(float) * 9);
+    facing_pyr_[slot] = facing_deg;
+}
+
+void GpuRenderer::render_frame_multi_pyramid(const std::vector<DmaBufFrame> &frames)
+{
+    collect_timer();
+
+    int n = std::min((int)frames.size(), num_cameras_multi_pyramid_);
+    int K = num_levels_multi_pyramid_;
+
+    for (int i = 0; i < n; ++i)
+        upload_nv12(frames[i], tex_y_pyr_[i], tex_uv_pyr_[i], 0, 1);
+
+    int level_w[kPyramidLevels], level_h[kPyramidLevels];
+    level_w[0] = W_;
+    level_h[0] = H_;
+    for (int lvl = 1; lvl < K; ++lvl) {
+        level_w[lvl] = std::max(1, level_w[lvl - 1] / 2);
+        level_h[lvl] = std::max(1, level_h[lvl - 1] / 2);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_pyr_);
+    if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
+
+    // ── Pass 1/5: per-camera warp + weight -> level-0 Gaussian ─────────────
+    glUseProgram(prog_pyr_warp_);
+    glViewport(0, 0, level_w[0], level_h[0]);
+    for (int i = 0; i < n; ++i) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_y_pyr_[i]);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, tex_uv_pyr_[i]);
+        glUniformMatrix3fv(u_H_pyr_loc_, 1, GL_FALSE, H_pyr_[i]);
+        glUniform1f(u_facing_pyr_loc_, facing_pyr_[i]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tex_pyr_gauss_[i][0], 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    // ── Pass 2/5: Gaussian pyramid (blur+downsample), per camera ───────────
+    glUseProgram(prog_pyr_downsample_);
+    for (int lvl = 0; lvl < K - 1; ++lvl) {
+        glUniform2f(u_pyr_texel_loc_, 1.0f / level_w[lvl], 1.0f / level_h[lvl]);
+        glViewport(0, 0, level_w[lvl + 1], level_h[lvl + 1]);
+        for (int i = 0; i < n; ++i) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_pyr_gauss_[i][lvl]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, tex_pyr_gauss_[i][lvl + 1], 0);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+    }
+
+    // ── Pass 3/5: Laplacian-diff, per camera per level ──────────────────────
+    glUseProgram(prog_pyr_laplace_);
+    for (int lvl = 0; lvl < K - 1; ++lvl) {
+        glViewport(0, 0, level_w[lvl], level_h[lvl]);
+        for (int i = 0; i < n; ++i) {
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, tex_pyr_gauss_[i][lvl]);
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, tex_pyr_gauss_[i][lvl + 1]);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, tex_pyr_lap_[i][lvl], 0);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+        }
+    }
+
+    // ── Pass 4/5: cross-camera blend, per level ─────────────────────────────
+    // Coarsest level blends each camera's coarsest Gaussian (this is exactly
+    // kFS_MULTI's normalized weighted average, evaluated at low res); every
+    // other level blends each camera's Laplacian band at that level.
+    glUseProgram(prog_pyr_blend_);
+    for (int lvl = 0; lvl < K; ++lvl) {
+        glViewport(0, 0, level_w[lvl], level_h[lvl]);
+        for (int i = 0; i < n; ++i) {
+            glActiveTexture(GL_TEXTURE0 + i);
+            GLuint src = (lvl == K - 1) ? tex_pyr_gauss_[i][lvl] : tex_pyr_lap_[i][lvl];
+            glBindTexture(GL_TEXTURE_2D, src);
+        }
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                               GL_TEXTURE_2D, tex_pyr_blended_[lvl], 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
+    // ── Pass 5/5: reconstruction, coarsest to finest ────────────────────────
+    // result_{K-1} = blended_{K-1} directly (no pass needed); level 0's
+    // result is written straight to fbo_tex_ -- same output contract as
+    // render_frame_multi(), so --preview/save_snapshot() need no changes.
+    glUseProgram(prog_pyr_recon_);
+    GLuint prev_result_tex = tex_pyr_blended_[K - 1];
+    for (int lvl = K - 2; lvl >= 0; --lvl) {
+        glViewport(0, 0, level_w[lvl], level_h[lvl]);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_pyr_blended_[lvl]);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, prev_result_tex);
+        GLuint dest = (lvl == 0) ? fbo_tex_ : tex_pyr_result_[lvl];
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, dest, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        prev_result_tex = dest;
+    }
+
     if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
     glFlush();
 }
@@ -1039,6 +1564,36 @@ void GpuRenderer::cleanup()
         if (tex_uv_multi_[i]) { glDeleteTextures(1, &tex_uv_multi_[i]); tex_uv_multi_[i] = 0; }
     }
     num_cameras_multi_ = 0;
+
+    if (prog_pyr_warp_)       { glDeleteProgram(prog_pyr_warp_);       prog_pyr_warp_       = 0; }
+    if (prog_pyr_downsample_) { glDeleteProgram(prog_pyr_downsample_); prog_pyr_downsample_ = 0; }
+    if (prog_pyr_laplace_)    { glDeleteProgram(prog_pyr_laplace_);    prog_pyr_laplace_    = 0; }
+    if (prog_pyr_blend_)      { glDeleteProgram(prog_pyr_blend_);      prog_pyr_blend_      = 0; }
+    if (prog_pyr_recon_)      { glDeleteProgram(prog_pyr_recon_);      prog_pyr_recon_      = 0; }
+    if (fbo_pyr_)             { glDeleteFramebuffers(1, &fbo_pyr_);    fbo_pyr_             = 0; }
+    for (int i = 0; i < num_cameras_multi_pyramid_; ++i) {
+        if (tex_y_pyr_[i])  { glDeleteTextures(1, &tex_y_pyr_[i]);  tex_y_pyr_[i]  = 0; }
+        if (tex_uv_pyr_[i]) { glDeleteTextures(1, &tex_uv_pyr_[i]); tex_uv_pyr_[i] = 0; }
+        for (int lvl = 0; lvl < num_levels_multi_pyramid_; ++lvl) {
+            if (tex_pyr_gauss_[i][lvl]) {
+                glDeleteTextures(1, &tex_pyr_gauss_[i][lvl]);
+                tex_pyr_gauss_[i][lvl] = 0;
+            }
+            if (lvl < num_levels_multi_pyramid_ - 1 && tex_pyr_lap_[i][lvl]) {
+                glDeleteTextures(1, &tex_pyr_lap_[i][lvl]);
+                tex_pyr_lap_[i][lvl] = 0;
+            }
+        }
+    }
+    for (int lvl = 0; lvl < num_levels_multi_pyramid_; ++lvl) {
+        if (tex_pyr_blended_[lvl]) { glDeleteTextures(1, &tex_pyr_blended_[lvl]); tex_pyr_blended_[lvl] = 0; }
+        if (lvl > 0 && lvl < num_levels_multi_pyramid_ - 1 && tex_pyr_result_[lvl]) {
+            glDeleteTextures(1, &tex_pyr_result_[lvl]);
+            tex_pyr_result_[lvl] = 0;
+        }
+    }
+    num_cameras_multi_pyramid_ = 0;
+    num_levels_multi_pyramid_  = 0;
 
     egl_ = nullptr;
 }

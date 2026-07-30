@@ -1,4 +1,5 @@
 build/
+build-native/
 libcamera-dmabuf-capture
 *.raw
 README.md

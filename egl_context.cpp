@@ -216,6 +216,14 @@ bool check_extensions(const EGLState &egl)
         { "GL_OES_EGL_image_external",       false, true  },
         // Optional — enables GPU-side timer queries for render profiling.
         { "GL_EXT_disjoint_timer_query",     false, false },
+        // Optional — needed for RGBA16F color-renderable FBOs (multi-band
+        // pyramid blend mode's Laplacian-level storage). Presence here is
+        // informational only: init_multi_pyramid() does its own real
+        // glCheckFramebufferStatus() probe rather than trusting this string,
+        // since GLES spec-legal features don't always work on this driver
+        // (see the sampler-array-indexing lesson elsewhere in this codebase).
+        { "GL_EXT_color_buffer_half_float",  false, false },
+        { "GL_EXT_color_buffer_float",       false, false },
     };
 
     std::cout << "\n[egl] Extension check:\n";
