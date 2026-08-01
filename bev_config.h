@@ -25,6 +25,16 @@ struct BevSlotConfig {
     double facing_deg = 90.0; // default: front
     bool   has_hb2i = false;
     mat3   hb2i; // board-metre -> image-pixel; valid only if has_hb2i
+
+    // Live-tuned (X/x, G/g, Y/y) offset from cam_x/cam_y/yaw above, for a
+    // has_hb2i slot -- see main.cpp's measured_H() comment. cam_x/cam_y/yaw
+    // stay the fixed pose the ChArUco shot was taken at (never overwritten by
+    // 'W' save) so the delta these three store is exactly the correction
+    // main.cpp needs to reproduce; if 'W' instead overwrote cam_x/cam_y/yaw
+    // directly, the delta would recompute to 0 on the next load and silently
+    // discard whatever offset had been tuned in, even though the raw numbers
+    // still landed correctly in the file.
+    double cam_x_delta = 0.0, cam_y_delta = 0.0, yaw_delta = 0.0;
 };
 
 struct BevConfig {

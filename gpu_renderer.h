@@ -65,6 +65,12 @@ public:
     // through the full 360 degrees during testing without the coverage
     // wedge hiding content outside a camera's real physical facing sector.
     void set_free_yaw(bool on);
+    // Coverage blend mode only (multi/kFS_MULTI; no-op for dual/pyramid):
+    // when on, per-camera blend weight comes from distance-to-edge of that
+    // camera's own homography-valid image bounds (calibration-derived)
+    // instead of the synthetic facing/uOverlap angular heuristic. Off by
+    // default -- feather and pyramid modes are unaffected either way.
+    void set_coverage_weight(bool enabled);
 
     // Uploads the per-camera BEV-pixel -> camera-image homographies built by
     // ground_to_image_H() (see ipm.h). Column-major float[9], dual mode only.

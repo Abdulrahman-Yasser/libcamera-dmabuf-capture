@@ -477,9 +477,16 @@ struct Slot {
 // pyramid blend (GpuRenderer::init_multi_pyramid() et al.), a separate,
 // comparable alternative selected via --blend pyramid. Both share the same
 // slot setup/keyboard loop below; only init/per-slot-setter/render differ.
-enum class BlendMode { Feather, Pyramid };
+// Coverage reuses Feather's exact pipeline (kFS_MULTI/prog_multi_/init_multi)
+// -- it only swaps that shader's per-fragment weight formula (see
+// GpuRenderer::set_coverage_weight()) from the synthetic facing/overlap
+// angular heuristic to a calibration-derived one (distance from each
+// camera's own homography-valid image bounds), so it needs none of
+// Pyramid's separate init/render/set_ipm dispatch.
+enum class BlendMode { Feather, Pyramid, Coverage };
 
 static int run_multi_file_mode(const std::vector<std::string> &paths,
+                               const std::vector<int> &cfg_slots,
                                const EGLState &egl, PreviewWindowPtr preview,
                                double cli_px_per_m, bool px_per_m_from_cli,
                                BlendMode blend_mode, const std::string &config_path)
@@ -497,15 +504,24 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     BevConfig cfg;
     if (!bev_config_load(config_path, cfg)) return 1;
 
-    // Measured ChArUco poses only cover slots 0/1 in the config (kMaxSlots'
-    // other entries are hand-tuned, has_hb2i=false) — extend the config
-    // (and kMaxSlots) before raising this cap if more measured-pose slots
-    // are ever needed.
-    if (n != 2 || !cfg.slots[0].has_hb2i || !cfg.slots[1].has_hb2i) {
-        std::cerr << "[multi] measured-homography path requires exactly 2 sources "
-                     "with hb2i configured for slot0/slot1 (got " << n
-                  << " source(s); check " << config_path << ")\n";
-        return 1;
+    // cfg_slots[i] is which bev_config.ini slot paths[i] reads pose/hb2i
+    // from -- identity (0,1,2,...) for plain --src, but a fixed 0/1/2/3
+    // mapping for --forward-*/--backward-*, so this has to be bounds- and
+    // hb2i-checked per source rather than assuming paths[i] <-> cfg.slots[i].
+    for (int i = 0; i < n; ++i) {
+        if (cfg_slots[i] < 0 || cfg_slots[i] >= BevConfig::kMaxSlots) {
+            std::cerr << "[multi] source " << i << " (" << paths[i] << ") maps to config "
+                         "slot " << cfg_slots[i] << ", out of range 0.."
+                      << (BevConfig::kMaxSlots - 1) << "\n";
+            return 1;
+        }
+        if (!cfg.slots[cfg_slots[i]].has_hb2i) {
+            std::cerr << "[multi] source " << i << " (" << paths[i] << ") maps to config "
+                         "slot " << cfg_slots[i] << ", which has no hb2i configured in "
+                      << config_path << " -- calibrate it with calibrate_bev.py "
+                         "--slot-a/--slot-b first\n";
+            return 1;
+        }
     }
 
     std::vector<Slot> slots(n);
@@ -521,12 +537,12 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
             std::cerr << "[multi] failed to get first frame for source " << i << "\n";
             return 1;
         }
-        if (i < BevConfig::kMaxSlots) {
-            const BevSlotConfig &sc = cfg.slots[i];
-            slots[i].params = SlotParams{ sc.cam_x, sc.cam_y, sc.cam_h, sc.pitch, sc.yaw };
-        } else {
-            slots[i].params = SlotParams{};
-        }
+        // Starting live pose is baseline + whatever delta was saved last time
+        // (see BevSlotConfig::cam_x_delta) -- not just the bare baseline, or
+        // a previously-tuned-and-saved offset would silently vanish on load.
+        const BevSlotConfig &sc = cfg.slots[cfg_slots[i]];
+        slots[i].params = SlotParams{ sc.cam_x + sc.cam_x_delta, sc.cam_y + sc.cam_y_delta,
+                                       sc.cam_h, sc.pitch, sc.yaw + sc.yaw_delta };
     }
 
     // Shared BEV canvas size — slot 0's first-frame dimensions, fixed for
@@ -556,15 +572,16 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     auto rebuild_slot = [&](int i, const char *changed) {
         const DmaBufFrame &f = slots[i].frame;
         const SlotParams  &p = slots[i].params;
+        const BevSlotConfig &sc = cfg.slots[cfg_slots[i]];
         // Deltas from this slot's as-loaded (calibration-time) pose -- see
         // measured_H()'s comment for why only cam_x/cam_y/yaw can be
         // live-tuned this way. Zero until the user actually touches
         // X/x, G/g, or Y/y, so an untouched slot's projection is bit-for-bit
         // the original fixed-Hb2i result.
-        double dx   = p.cam_x - cfg.slots[i].cam_x;
-        double dy   = p.cam_y - cfg.slots[i].cam_y;
-        double dyaw = p.yaw   - cfg.slots[i].yaw;
-        mat3 H = measured_H(cfg.slots[i].hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
+        double dx   = p.cam_x - sc.cam_x;
+        double dy   = p.cam_y - sc.cam_y;
+        double dyaw = p.yaw   - sc.yaw;
+        mat3 H = measured_H(sc.hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
                             dx, dy, dyaw);
         float Hf[9];
         H.to_floats(Hf);
@@ -575,14 +592,14 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
         // few degrees left/right via yaw) both correctly claim the front
         // sector instead of splitting 90 degrees apart. Live yaw-tuning
         // reprojects content via dyaw above without moving this boundary.
-        float facing_deg = (float)cfg.slots[i].facing_deg;
+        float facing_deg = (float)sc.facing_deg;
         if (blend_mode == BlendMode::Pyramid)
             renderer.set_ipm_multi_pyramid(i, Hf, facing_deg);
         else
             renderer.set_ipm_multi(i, Hf, facing_deg);
         std::printf("[multi] slot %d %-10s cam_x=%.2fm cam_y=%.2fm h=%.2fm "
                     "pitch=%.1fdeg yaw=%.1fdeg (facing %.0fdeg, fixed)\n",
-                    i + 1, changed, p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw,
+                    cfg_slots[i] + 1, changed, p.cam_x, p.cam_y, p.cam_h, p.pitch, p.yaw,
                     facing_deg);
     };
     auto rebuild_all = [&](const char *changed) {
@@ -600,10 +617,14 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     std::string path_buf;
     renderer.set_stitch_overlap(overlap_deg);
     renderer.set_blend_edge(blend_edge);
+    renderer.set_coverage_weight(blend_mode == BlendMode::Coverage);
     renderer.set_px_per_m((float)px_per_m);
 
     std::printf("[multi] %d source(s) loaded, blend=%s\n", n,
                 blend_mode == BlendMode::Pyramid ? "pyramid" : "feather");
+    for (int i = 0; i < n; ++i)
+        std::printf("[multi]   source %d -> config slot %d (%s)\n",
+                    i, cfg_slots[i] + 1, paths[i].c_str());
     std::printf(
         "[keys] s=snapshot  +/-=overlap(deg)  [/]=sharpness  c=sanity-check  "
         "F=toggle free-yaw\n"
@@ -705,12 +726,13 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                 for (int i = 0; i < n; ++i) {
                     const DmaBufFrame &f = slots[i].frame;
                     const SlotParams &p = slots[i].params;
-                    mat3 H = measured_H(cfg.slots[i].hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
-                                        p.cam_x - cfg.slots[i].cam_x,
-                                        p.cam_y - cfg.slots[i].cam_y,
-                                        p.yaw   - cfg.slots[i].yaw);
+                    const BevSlotConfig &sc = cfg.slots[cfg_slots[i]];
+                    mat3 H = measured_H(sc.hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
+                                        p.cam_x - sc.cam_x,
+                                        p.cam_y - sc.cam_y,
+                                        p.yaw   - sc.yaw);
                     char label[16];
-                    std::snprintf(label, sizeof(label), "slot%d", i + 1);
+                    std::snprintf(label, sizeof(label), "slot%d", cfg_slots[i] + 1);
                     ipm_debug_check(H, canvas_w, canvas_h, label);
                 }
             } else if (key == 'F') {
@@ -721,15 +743,22 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                                        "anywhere its own homography is valid"
                                      : "back to facing-sector-limited blending");
             } else if (key == 'W') {
-                BevConfig save_cfg   = cfg; // keeps has_hb2i/hb2i + any slot>=n untouched
+                BevConfig save_cfg   = cfg; // keeps has_hb2i/hb2i + any slot not currently loaded untouched
                 save_cfg.px_per_m    = px_per_m;
                 save_cfg.overlap_deg = overlap_deg;
                 save_cfg.blend_edge  = blend_edge;
-                for (int i = 0; i < n && i < BevConfig::kMaxSlots; ++i) {
+                for (int i = 0; i < n; ++i) {
                     const SlotParams &p = slots[i].params;
-                    BevSlotConfig    &s = save_cfg.slots[i];
-                    s.cam_x = p.cam_x; s.cam_y = p.cam_y; s.cam_h = p.cam_h;
-                    s.pitch = p.pitch; s.yaw   = p.yaw;
+                    BevSlotConfig    &s = save_cfg.slots[cfg_slots[i]];
+                    // cam_x/cam_y/yaw stay the fixed calibration-time baseline
+                    // (read before being overwritten below) -- only the delta
+                    // from it is saved, or a tuned offset would silently
+                    // reset to 0 on the next load (see cam_x_delta's comment).
+                    s.cam_x_delta = p.cam_x - s.cam_x;
+                    s.cam_y_delta = p.cam_y - s.cam_y;
+                    s.yaw_delta   = p.yaw   - s.yaw;
+                    s.cam_h = p.cam_h;
+                    s.pitch = p.pitch;
                 }
                 if (bev_config_save(config_path, save_cfg)) {
                     cfg = save_cfg;
@@ -755,41 +784,41 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                 path_buf.clear();
                 std::printf("\n[multi] editing slot %d path (current: %s) — "
                             "type new path, Enter=commit, Esc=cancel:\n> ",
-                            active_slot + 1, slots[active_slot].path.c_str());
+                            cfg_slots[active_slot] + 1, slots[active_slot].path.c_str());
                 std::fflush(stdout);
             } else if (key >= '1' && key <= '9') {
                 int idx = key - '1';
                 if (idx < n) {
                     active_slot = idx;
                     std::printf("[multi] active slot -> %d (%s)\n",
-                                active_slot + 1, slots[active_slot].path.c_str());
+                                cfg_slots[active_slot] + 1, slots[active_slot].path.c_str());
                 } else {
                     std::printf("[multi] slot %d doesn't exist (only %d loaded)\n", idx + 1, n);
                 }
             } else if (key == 'H') {
                 slots[active_slot].params.cam_h = std::min(slots[active_slot].params.cam_h + 0.05, 3.0);
                 rebuild_slot(active_slot, "height+");
-                if (cfg.slots[active_slot].has_hb2i)
+                if (cfg.slots[cfg_slots[active_slot]].has_hb2i)
                     std::printf("[multi] note: cam_h is baked into slot %d's calibrated "
-                                "homography and has no visual effect here\n", active_slot + 1);
+                                "homography and has no visual effect here\n", cfg_slots[active_slot] + 1);
             } else if (key == 'h') {
                 slots[active_slot].params.cam_h = std::max(slots[active_slot].params.cam_h - 0.05, 0.2);
                 rebuild_slot(active_slot, "height-");
-                if (cfg.slots[active_slot].has_hb2i)
+                if (cfg.slots[cfg_slots[active_slot]].has_hb2i)
                     std::printf("[multi] note: cam_h is baked into slot %d's calibrated "
-                                "homography and has no visual effect here\n", active_slot + 1);
+                                "homography and has no visual effect here\n", cfg_slots[active_slot] + 1);
             } else if (key == 'P') {
                 slots[active_slot].params.pitch = std::min(slots[active_slot].params.pitch + 1.0, -1.0);
                 rebuild_slot(active_slot, "pitch+");
-                if (cfg.slots[active_slot].has_hb2i)
+                if (cfg.slots[cfg_slots[active_slot]].has_hb2i)
                     std::printf("[multi] note: pitch is baked into slot %d's calibrated "
-                                "homography and has no visual effect here\n", active_slot + 1);
+                                "homography and has no visual effect here\n", cfg_slots[active_slot] + 1);
             } else if (key == 'p') {
                 slots[active_slot].params.pitch = std::max(slots[active_slot].params.pitch - 1.0, -89.0);
                 rebuild_slot(active_slot, "pitch-");
-                if (cfg.slots[active_slot].has_hb2i)
+                if (cfg.slots[cfg_slots[active_slot]].has_hb2i)
                     std::printf("[multi] note: pitch is baked into slot %d's calibrated "
-                                "homography and has no visual effect here\n", active_slot + 1);
+                                "homography and has no visual effect here\n", cfg_slots[active_slot] + 1);
             } else if (key == 'Y') {
                 slots[active_slot].params.yaw = std::fmod(slots[active_slot].params.yaw + 1.0, 360.0);
                 rebuild_slot(active_slot, "yaw+");
@@ -806,7 +835,7 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                 slots[active_slot].params.cam_x = std::min(slots[active_slot].params.cam_x + 0.05, 5.0);
                 rebuild_slot(active_slot, "cam_x+");
             } else if (key == 'x') {
-                slots[active_slot].params.cam_x = std::max(slots[active_slot].params.cam_x - 0.05, -5.0);
+                slots[active_slot].params.cam_x = std::max(slots[active_slot].params.cam_x - 0.05, -30.0);
                 rebuild_slot(active_slot, "cam_x-");
             }
         }
@@ -833,6 +862,14 @@ int main(int argc, char *argv[])
     const char *file_left  = nullptr;
     const char *file_right = nullptr;
     std::vector<std::string> sources;  // --src, repeatable; N-camera surround mode
+    // Named alternative to --src for the 2-pair (front+back) surround rig --
+    // each flag pins its source to a FIXED bev_config.ini slot (0/1/2/3)
+    // instead of a --src's position in argv, so e.g. a backward-only run
+    // still reads slot2/slot3's calibrated hb2i rather than slot0/slot1's.
+    const char *fwd_left  = nullptr;
+    const char *fwd_right = nullptr;
+    const char *bwd_left  = nullptr;
+    const char *bwd_right = nullptr;
     IpmParams   ipm;
     bool        preview_requested  = false;
     bool        bev_requested      = false;
@@ -852,6 +889,10 @@ int main(int argc, char *argv[])
         else if (a == "--file-left"  && i + 1 < argc) file_left  = argv[++i];
         else if (a == "--file-right" && i + 1 < argc) file_right = argv[++i];
         else if (a == "--src"        && i + 1 < argc) sources.push_back(argv[++i]);
+        else if (a == "--forward-left"   && i + 1 < argc) fwd_left   = argv[++i];
+        else if (a == "--forward-right"  && i + 1 < argc) fwd_right  = argv[++i];
+        else if (a == "--backward-left"  && i + 1 < argc) bwd_left   = argv[++i];
+        else if (a == "--backward-right" && i + 1 < argc) bwd_right  = argv[++i];
         else if (a == "--preview") preview_requested = true;
         else if (a == "--bev") bev_requested = true;
         else if (a == "--config"     && i + 1 < argc) config_path = argv[++i];
@@ -859,7 +900,8 @@ int main(int argc, char *argv[])
             std::string mode = argv[++i];
             if (mode == "pyramid") blend_mode = BlendMode::Pyramid;
             else if (mode == "feather") blend_mode = BlendMode::Feather;
-            else { std::cerr << "[multi] unknown --blend mode '" << mode << "' (use feather|pyramid)\n"; return 1; }
+            else if (mode == "coverage") blend_mode = BlendMode::Coverage;
+            else { std::cerr << "[multi] unknown --blend mode '" << mode << "' (use feather|pyramid|coverage)\n"; return 1; }
         }
         else if (a == "--baseline"   && i + 1 < argc) ipm.baseline = std::atof(argv[++i]);
         else if (a == "--h"          && i + 1 < argc) ipm.cam_h    = std::atof(argv[++i]);
@@ -871,11 +913,40 @@ int main(int argc, char *argv[])
             px_per_m_from_cli = true;
         }
     }
+
+    // cfg_slots[i] is the bev_config.ini slot that sources[i] reads its
+    // pose/hb2i from. Plain --src keeps the old identity mapping (position
+    // in argv == config slot); --forward-*/--backward-* pin fixed slots
+    // (0/1/2/3) instead so a partial (e.g. backward-only) run still lands
+    // on the right slots rather than sliding down to 0/1.
+    bool any_named = fwd_left || fwd_right || bwd_left || bwd_right;
+    if (any_named && !sources.empty()) {
+        std::cerr << "[multi] --forward-*/--backward-* can't be combined with --src\n";
+        return 1;
+    }
+    std::vector<int> cfg_slots;
+    if (any_named) {
+        if ((fwd_left != nullptr) != (fwd_right != nullptr)) {
+            std::cerr << "[multi] --forward-left and --forward-right must be given together\n";
+            return 1;
+        }
+        if ((bwd_left != nullptr) != (bwd_right != nullptr)) {
+            std::cerr << "[multi] --backward-left and --backward-right must be given together\n";
+            return 1;
+        }
+        if (fwd_left)  { sources.push_back(fwd_left);  cfg_slots.push_back(0); }
+        if (fwd_right) { sources.push_back(fwd_right); cfg_slots.push_back(1); }
+        if (bwd_left)  { sources.push_back(bwd_left);  cfg_slots.push_back(2); }
+        if (bwd_right) { sources.push_back(bwd_right); cfg_slots.push_back(3); }
+    } else {
+        cfg_slots.resize(sources.size());
+        for (size_t i = 0; i < sources.size(); ++i) cfg_slots[i] = (int)i;
+    }
     {
         int max_cams = (blend_mode == BlendMode::Pyramid)
                        ? GpuRenderer::kPyramidMaxCameras : GpuRenderer::kMaxCameras;
         if ((int)sources.size() > max_cams) {
-            std::cerr << "[multi] " << sources.size() << " --src sources requested, "
+            std::cerr << "[multi] " << sources.size() << " source(s) requested, "
                          "max is " << max_cams << "\n";
             return 1;
         }
@@ -925,7 +996,7 @@ int main(int argc, char *argv[])
     std::cout << "[egl] context ready\n\n";
 
     if (!sources.empty()) {
-        int rc = run_multi_file_mode(sources, active_egl, preview_ptr, ipm.px_per_m,
+        int rc = run_multi_file_mode(sources, cfg_slots, active_egl, preview_ptr, ipm.px_per_m,
                                      px_per_m_from_cli, blend_mode, config_path);
         teardown_egl(egl);
         return rc;

@@ -177,12 +177,17 @@ class WlOutputHandler     : public wayland::client::CWlOutput<WlOutputHandler> {
 
 struct WaylandPreviewWindow::Impl {
     // ── Callbacks used by the CRTP handler templates ─────────────────────────
-    // ack_configure is required by the xdg-shell protocol (the compositor may
-    // withhold mapping the surface without it) -- agl-compositor tolerated
-    // its absence, but stock GNOME/mutter and weston do not.
-    void OnXdgSurfaceConfigure(uint32_t serial) noexcept
+    // wl::XdgSurfaceHandler<App>::OnConfigure (xdg_shell.hpp) already calls
+    // AckConfigure(serial) before invoking this -- do NOT ack again here.
+    // Doing so double-acks every configure event (harmless-looking the first
+    // time, since re-acking an already-acked serial 1 was apparently
+    // tolerated, but a second configure event -- serial 2 -- getting
+    // double-acked is what actually triggered
+    // "xdg_wm_base error 4: Wrong configure serial: 2" on real hardware,
+    // which kills the wl_display connection and cascades into
+    // "eglInitialize failed: 0x3001" downstream.
+    void OnXdgSurfaceConfigure(uint32_t /*serial*/) noexcept
     {
-        xdg_surface_.Get()->AckConfigure(serial);
         configured_ = true;
     }
 

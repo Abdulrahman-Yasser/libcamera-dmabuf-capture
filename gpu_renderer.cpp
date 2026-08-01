@@ -250,6 +250,14 @@ uniform float uBlendEdge;
 // see behind themselves), but useful for freely sweeping yaw during testing
 // without fighting the coverage wedge. Off (0) by default.
 uniform float uFreeYaw;
+// >0.5: use calibration-derived coverage-confidence weighting (distance, in
+// normalized uv, from this camera's own homography-valid image bounds)
+// instead of the synthetic facing/overlap angular heuristic below. Reuses
+// uBlendEdge as the margin falloff width (same "how sharp is the crossover"
+// role it already plays for the angular scheme -- same pattern uOverlap
+// already uses, reinterpreted degrees-vs-meters between kFS_MULTI/kFS_DUAL,
+// see the comment above kFS_MULTI's declaration). Off (0) by default.
+uniform float uUseCoverageWeight;
 
 out vec4 fragColor;
 
@@ -271,7 +279,19 @@ const float kPi = 3.14159265358979;
                             && all(lessThanEqual(uv, vec2(1.0)));           \
         if (ok) {                                                           \
             float w;                                                        \
-            if (uFreeYaw > 0.5) {                                           \
+            if (uUseCoverageWeight > 0.5) {                                 \
+                /* Distance from this camera's own valid-image-bounds edge, */\
+                /* in normalized uv -- calibration-derived (straight from  */\
+                /* uH[IDX]), analogous to OpenCV FeatherBlender's per-      */\
+                /* source distance-transform mask, computed analytically   */\
+                /* instead of via a precomputed texture. No uFreeYaw       */\
+                /* bypass here: there's no angular wedge to bypass, weight */\
+                /* already comes straight from this camera's own           */\
+                /* homography validity.                                   */\
+                vec2  margin2 = min(uv, vec2(1.0) - uv);                    \
+                float margin  = min(margin2.x, margin2.y);                 \
+                w = smoothstep(0.0, max(uBlendEdge, 1e-4), margin);         \
+            } else if (uFreeYaw > 0.5) {                                    \
                 w = 1.0;                                                    \
             } else {                                                        \
                 /* Angular distance from this fragment's bearing to camera */\
@@ -1068,6 +1088,19 @@ void GpuRenderer::set_free_yaw(bool on)
     }
 }
 
+void GpuRenderer::set_coverage_weight(bool enabled)
+{
+    // Only kFS_MULTI (Feather/Coverage share this pipeline) has this
+    // uniform -- not wired into kFS_PYR_WARP in this pass (see kFS_MULTI's
+    // comment above for why that's a natural, cheap follow-up rather than
+    // done now: same uv/ok it already computes, just not plumbed through).
+    float v = enabled ? 1.0f : 0.0f;
+    if (prog_multi_) {
+        glUseProgram(prog_multi_);
+        glUniform1f(glGetUniformLocation(prog_multi_, "uUseCoverageWeight"), v);
+    }
+}
+
 void GpuRenderer::set_ipm(const float H_left[9], const float H_right[9])
 {
     if (!prog_dual_) return;
@@ -1163,6 +1196,7 @@ bool GpuRenderer::init_multi(const EGLState &egl, int w, int h, int stride, int 
     glUniform1f(glGetUniformLocation(prog_multi_, "uOverlap"),    60.0f);
     glUniform1f(glGetUniformLocation(prog_multi_, "uBlendEdge"), 0.45f);
     glUniform1f(glGetUniformLocation(prog_multi_, "uFreeYaw"),    0.0f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uUseCoverageWeight"), 0.0f);
     // BEV canvas size — fixed for the lifetime of this renderer, matching
     // kFS_DUAL's uBevWidth/uBevHeight.
     glUniform1f(glGetUniformLocation(prog_multi_, "uBevWidth"),  (float)w);

@@ -17,26 +17,27 @@ BevConfig bev_config_defaults()
     // facing_deg=90 (front), not the 90-degree-apart front/right split this
     // template originally assumed. Slots 2/3 are still-unused placeholders
     // for a future back/left camera pair.
-    // Recalibrated from street_captures/20260623_101549's camA.png/camB.png
+    // Recalibrated from street_captures/f_20260623_101125's camA.png/camB.png
     // (a single shared ChArUco board shot, both cameras, not moved between
     // frames) via cv2.findHomography(board-metres -> image-pixels) per
     // camera, RANSAC, then rescaled from that capture's 1640x1232 into the
     // 3280x2464 CAL_W/CAL_H space main.cpp's measured_H() assumes (see its
     // comment -- must match the resolution the board was shot at, not the
-    // runtime video's own size). 10 shared corners: median=1.36mm,
-    // mean=1.30mm, max=2.16mm overlap alignment error. Supersedes an earlier
-    // pair recalibrated the same way from captures/20260623_100123 (indoor;
-    // median=0.77mm/mean=0.86mm/max=2.42mm) -- swap back to that pair if
-    // testing indoors again, see BUGS_FOUND.md bug #3 for how these are
-    // derived and why they must come from one shared shot, not independently
-    // plausible ones.
+    // runtime video's own size). 9 shared corners: median=0.91mm,
+    // mean=0.98mm, max=2.40mm overlap alignment error. Supersedes earlier
+    // pairs recalibrated the same way from street_captures/20260623_101549
+    // (median=1.36mm/mean=1.30mm/max=2.16mm) and captures/20260623_100123
+    // (indoor; median=0.77mm/mean=0.86mm/max=2.42mm) -- swap back to whichever
+    // matches what's actually being tested, see BUGS_FOUND.md bug #3 for how
+    // these are derived and why they must come from one shared shot, not
+    // independently plausible ones.
     cfg.slots[0] = BevSlotConfig{
         -0.095, 0.0, 0.45, -30.0, 15.0, 90.0, true,
-        mat3{{ 381.189, -1179.514, 0.7100417, 3255.635, 94.37832, 0.2794913, -757.7147, 1378.566, 1 }}
+        mat3{{ 188.9045, -1087.857, 0.6601708, 3025.682, 42.45147, 0.3074604, -482.5418, 1153.304, 1 }}
     };
     cfg.slots[1] = BevSlotConfig{
         0.095, 0.0, 0.45, -30.0, -15.0, 90.0, true,
-        mat3{{ 1806.655, -760.9841, 0.5571218, 1630.012, 97.27809, -0.281527, 1891.094, 1240.923, 1 }}
+        mat3{{ 1305.29, -738.869, 0.5491576, 1781.791, 72.92492, -0.150135, 1650.012, 1077.979, 1 }}
     };
     cfg.slots[2] = BevSlotConfig{ 0.0, -1.0, 1.2, -30.0, 180.0, 270.0, false, mat3{} };
     cfg.slots[3] = BevSlotConfig{ -0.5, 0.0, 1.2, -30.0,  90.0, 180.0, false, mat3{} };
@@ -142,6 +143,9 @@ bool bev_config_load(const std::string &path, BevConfig &out)
                 else if (key == "cam_h") s.cam_h = std::stod(val);
                 else if (key == "pitch") s.pitch = std::stod(val);
                 else if (key == "yaw")   s.yaw   = std::stod(val);
+                else if (key == "cam_x_delta") s.cam_x_delta = std::stod(val);
+                else if (key == "cam_y_delta") s.cam_y_delta = std::stod(val);
+                else if (key == "yaw_delta")   s.yaw_delta   = std::stod(val);
                 else if (key == "facing") {
                     if (!parse_facing(val, s.facing_deg)) {
                         std::cerr << "[config] " << path << ":" << lineno
@@ -200,6 +204,9 @@ bool bev_config_save(const std::string &path, const BevConfig &cfg)
         out << "cam_h = " << s.cam_h << "\n";
         out << "pitch = " << s.pitch << "\n";
         out << "yaw = "   << s.yaw   << "\n";
+        out << "cam_x_delta = " << s.cam_x_delta << "\n";
+        out << "cam_y_delta = " << s.cam_y_delta << "\n";
+        out << "yaw_delta = "   << s.yaw_delta   << "\n";
         out << "facing = " << s.facing_deg << "\n";
         if (s.has_hb2i) {
             out << "hb2i =";
