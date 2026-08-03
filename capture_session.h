@@ -2,32 +2,44 @@
 
 #include <libcamera/libcamera.h>
 
+#include <atomic>
 #include <condition_variable>
-#include <fstream>
 #include <mutex>
+#include <queue>
+#include <utility>
 
 class CaptureSession {
 public:
     static constexpr int WARMUP_FRAMES = 30;
 
-    explicit CaptureSession(const libcamera::StreamConfiguration &sc,
-                            libcamera::Camera *camera);
+    CaptureSession(const libcamera::StreamConfiguration &sc,
+                   libcamera::Camera *camera);
 
     void requestCompleted(libcamera::Request *req);
-    void waitDone();
-    const libcamera::FrameBuffer *capturedBuffer() const { return captured_buf_; }
+
+    // Block until AE/AWB warmup frames are done.
+    void waitWarmupDone();
+
+    // Block until the next frame is available.
+    // Returns {buffer, request} — caller must requeue the request.
+    // Returns {nullptr, nullptr} after stop() is called.
+    std::pair<const libcamera::FrameBuffer *,
+              libcamera::Request *> nextFrame();
+
+    void stop();
 
 private:
-    void saveRaw(const libcamera::FrameBuffer *buf);
-    void writeRows(std::ofstream &out,
-                   const libcamera::FrameBuffer::Plane &plane,
-                   unsigned int rows);
-
     const libcamera::StreamConfiguration &sc_;
     libcamera::Camera                    *camera_;
-    std::mutex                            mtx_;
-    std::condition_variable               cv_;
-    bool                                  done_        = false;
-    int                                   frameCount_  = 0;
-    const libcamera::FrameBuffer         *captured_buf_ = nullptr;
+    int                                   frameCount_ = 0;
+
+    std::mutex              warmup_mtx_;
+    std::condition_variable warmup_cv_;
+    bool                    warmup_done_ = false;
+
+    std::mutex              mtx_;
+    std::condition_variable cv_;
+    std::queue<std::pair<const libcamera::FrameBuffer *,
+                         libcamera::Request *>> ready_;
+    std::atomic<bool>       running_{true};
 };
