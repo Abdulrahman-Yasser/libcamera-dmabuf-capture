@@ -109,6 +109,19 @@ public:
     void set_ipm_multi(int slot, const float H[9], float facing_deg);
     int  num_cameras_multi() const { return num_cameras_multi_; }
 
+    // Loads a top-down car PNG (RGBA, transparent background, front at image
+    // row 0) once and records real vehicle width/length in meters, so
+    // draw_car_icon() can composite it -- correctly scaled -- over the BEV
+    // canvas's permanently camera-blind center (no camera mounted on the
+    // vehicle can see under/through it, so that region is otherwise always
+    // black -- see kFS_MULTI's weightSum==0 fallback). Returns false (the
+    // renderer keeps working, just without the icon) if the file can't be
+    // read -- this is a cosmetic overlay, not required for rendering to
+    // function. Composited by draw_car_icon() from both render_frame_multi()
+    // and render_frame_multi_pyramid()'s tails (both write to fbo_tex_), so
+    // it shows up under every --blend mode.
+    bool init_car_icon(const char *png_path, float width_m, float length_m);
+
     // N-camera surround-view BEV, multi-band (Laplacian pyramid) blend —
     // a separate, comparable alternative to init_multi()/render_frame_multi()
     // above (kFS_MULTI's single-pass angular-weighted "feathering" blend).
@@ -159,6 +172,12 @@ private:
     void        upload_nv12(const DmaBufFrame &f, GLuint tex_y, GLuint tex_uv,
                             int unit_y, int unit_uv);
     void        collect_timer();
+    // Composites the loaded car icon (if any) over whatever's currently
+    // bound as the color attachment -- called from both
+    // render_frame_multi() and render_frame_multi_pyramid()'s tails, right
+    // before their glFlush(). No-op if init_car_icon() was never
+    // called/failed (prog_car_ == 0).
+    void        draw_car_icon();
 
     const EGLState *egl_    = nullptr;
     int             W_      = 0;
@@ -192,6 +211,13 @@ private:
     GLint  u_H_multi_[kMaxCameras]      = {};
     GLint  u_facing_multi_[kMaxCameras] = {};
     int    num_cameras_multi_ = 0;
+
+    // Car icon overlay (draw_car_icon()) -- own tiny program/texture, no
+    // relation to the per-camera arrays above.
+    GLuint prog_car_     = 0;
+    GLuint tex_car_      = 0;
+    float  car_half_w_m_ = 0.0f;   // vehicle width  / 2, meters
+    float  car_half_l_m_ = 0.0f;   // vehicle length / 2, meters
 
     // N-camera surround-view, multi-band (Laplacian pyramid) blend mode.
     // Own programs and own per-camera source textures — deliberately

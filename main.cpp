@@ -489,7 +489,9 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                                const std::vector<int> &cfg_slots,
                                const EGLState &egl, PreviewWindowPtr preview,
                                double cli_px_per_m, bool px_per_m_from_cli,
-                               BlendMode blend_mode, const std::string &config_path)
+                               BlendMode blend_mode, const std::string &config_path,
+                               const std::string &car_icon_path,
+                               double car_width_m, double car_length_m)
 {
     int n = (int)paths.size();
     int max_cams = (blend_mode == BlendMode::Pyramid)
@@ -560,6 +562,12 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
         ? renderer.init_multi_pyramid(egl, canvas_w, canvas_h, canvas_stride, n)
         : renderer.init_multi(egl, canvas_w, canvas_h, canvas_stride, n);
     if (!init_ok) return 1;
+
+    if (!car_icon_path.empty() &&
+        !renderer.init_car_icon(car_icon_path.c_str(), (float)car_width_m, (float)car_length_m)) {
+        std::cerr << "[multi] car icon '" << car_icon_path
+                  << "' failed to load -- continuing without it\n";
+    }
 
     // CLI --px-per-m wins if given; otherwise fall back to the config file's
     // default (bev_config_defaults() if the file didn't specify one either).
@@ -883,6 +891,14 @@ int main(int argc, char *argv[])
     // single-pass angular-weighted "feather" blend (kFS_MULTI) -- --src
     // mode only, a separate/comparable alternative, not a replacement.
     BlendMode   blend_mode = BlendMode::Feather;
+    // Static top-down car icon composited over the BEV canvas's permanently
+    // camera-blind center -- opt-in (no default path/CWD guessing, unlike
+    // config_path's bev_config_defaults() fallback: there's no equivalent
+    // built-in default icon to fall back to). --car-width/--car-length only
+    // matter if --car-icon is also given.
+    std::string car_icon_path;
+    double      car_width_m  = 1.8;
+    double      car_length_m = 4.5;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--file"            && i + 1 < argc) file_path  = argv[++i];
@@ -912,6 +928,9 @@ int main(int argc, char *argv[])
             ipm.px_per_m      = std::atof(argv[++i]);
             px_per_m_from_cli = true;
         }
+        else if (a == "--car-icon"   && i + 1 < argc) car_icon_path = argv[++i];
+        else if (a == "--car-width"  && i + 1 < argc) car_width_m  = std::atof(argv[++i]);
+        else if (a == "--car-length" && i + 1 < argc) car_length_m = std::atof(argv[++i]);
     }
 
     // cfg_slots[i] is the bev_config.ini slot that sources[i] reads its
@@ -997,7 +1016,8 @@ int main(int argc, char *argv[])
 
     if (!sources.empty()) {
         int rc = run_multi_file_mode(sources, cfg_slots, active_egl, preview_ptr, ipm.px_per_m,
-                                     px_per_m_from_cli, blend_mode, config_path);
+                                     px_per_m_from_cli, blend_mode, config_path,
+                                     car_icon_path, car_width_m, car_length_m);
         teardown_egl(egl);
         return rc;
     }
