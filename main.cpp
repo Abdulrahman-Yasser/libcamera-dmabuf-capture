@@ -78,6 +78,16 @@ static mat3 measured_H(const mat3 &Hb2i, int img_w, int img_h,
     return H;
 }
 
+// Naming-convention lookup for a per-lens-model distortion file:
+// "<lens_dir>/<lens_model>-lens.ini". lens_model is used verbatim -- no
+// hyphenation normalization -- so "imx219" and "imx-219" are two different
+// files, consistently with whatever the user actually typed/saved.
+static std::string lens_calib_path(const std::string &lens_dir, const std::string &lens_model)
+{
+    if (lens_dir.empty() || lens_dir.back() == '/') return lens_dir + lens_model + "-lens.ini";
+    return lens_dir + "/" + lens_model + "-lens.ini";
+}
+
 // Points at the active WaylandPreviewWindow, or null when --preview wasn't
 // requested / this build has no preview support. Kept as a plain type alias
 // (rather than #ifdef-ing every function signature that takes one) so
@@ -489,7 +499,13 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                                const std::vector<int> &cfg_slots,
                                const EGLState &egl, PreviewWindowPtr preview,
                                double cli_px_per_m, bool px_per_m_from_cli,
-                               BlendMode blend_mode, const std::string &config_path)
+                               BlendMode blend_mode, const std::string &config_path,
+                               const std::string &car_icon_path,
+                               double cli_car_width, bool car_width_from_cli,
+                               double cli_car_length, bool car_length_from_cli,
+                               double cli_car_x, bool car_x_from_cli,
+                               double cli_car_y, bool car_y_from_cli,
+                               const std::string &lens_dir)
 {
     int n = (int)paths.size();
     int max_cams = (blend_mode == BlendMode::Pyramid)
@@ -561,6 +577,20 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
         : renderer.init_multi(egl, canvas_w, canvas_h, canvas_stride, n);
     if (!init_ok) return 1;
 
+    // CLI --car-width/--car-length/--car-x/--car-y win if given; otherwise
+    // fall back to the config file's car_width/car_length/car_x/car_y (see
+    // bev_config.h) -- same resolution pattern as px_per_m just below.
+    double car_width_m  = car_width_from_cli  ? cli_car_width  : cfg.car_width;
+    double car_length_m = car_length_from_cli ? cli_car_length : cfg.car_length;
+    double car_x_m       = car_x_from_cli      ? cli_car_x      : cfg.car_x;
+    double car_y_m       = car_y_from_cli      ? cli_car_y      : cfg.car_y;
+    if (!car_icon_path.empty() &&
+        !renderer.init_car_icon(car_icon_path.c_str(), (float)car_width_m, (float)car_length_m,
+                                (float)car_x_m, (float)car_y_m)) {
+        std::cerr << "[multi] car icon '" << car_icon_path
+                  << "' failed to load -- continuing without it\n";
+    }
+
     // CLI --px-per-m wins if given; otherwise fall back to the config file's
     // default (bev_config_defaults() if the file didn't specify one either).
     double px_per_m = px_per_m_from_cli ? cli_px_per_m : cfg.px_per_m;
@@ -606,6 +636,74 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
         for (int i = 0; i < n; ++i) rebuild_slot(i, changed);
     };
 
+    // Lens distortion has nothing to do with pose (fx/fy/../k1.. don't
+    // depend on cam_x/y/h/pitch/yaw at all), so it's pushed separately from
+    // rebuild_slot/rebuild_all -- rescales fx/fy/cx/cy from the lens file's
+    // own calib_w/h to this slot's actual runtime frame size, pre-normalizes
+    // into [0,1] uv terms, and uploads. has_distortion=false pushes the
+    // all-zero/off state, matching init_multi()/init_multi_pyramid()'s own
+    // default.
+    auto push_distortion = [&](int i, const BevSlotConfig &sc) {
+        float fxn = 0, fyn = 0, cxn = 0, cyn = 0;
+        if (sc.has_distortion) {
+            const DmaBufFrame &f = slots[i].frame;
+            float sx = (float)f.width  / (float)sc.lens_calib_w;
+            float sy = (float)f.height / (float)sc.lens_calib_h;
+            fxn = (float)sc.fx * sx / (float)f.width;
+            fyn = (float)sc.fy * sy / (float)f.height;
+            cxn = (float)sc.cx * sx / (float)f.width;
+            cyn = (float)sc.cy * sy / (float)f.height;
+        }
+        if (blend_mode == BlendMode::Pyramid)
+            renderer.set_distortion_multi_pyramid(i, sc.has_distortion, fxn, fyn, cxn, cyn,
+                (float)sc.k1, (float)sc.k2, (float)sc.k3, (float)sc.p1, (float)sc.p2);
+        else
+            renderer.set_distortion_multi(i, sc.has_distortion, fxn, fyn, cxn, cyn,
+                (float)sc.k1, (float)sc.k2, (float)sc.k3, (float)sc.p1, (float)sc.p2);
+    };
+
+    // Looks up "<lens_dir>/<model>-lens.ini", and on success writes its
+    // numbers straight into cfg.slots[cfg_slots[i]] (not a shadow copy) --
+    // unlike pose, lens_model has no "delta from calibration baseline"
+    // concept, so 'W' round-trips it for free via save_cfg = cfg, same as
+    // has_hb2i/hb2i already do for fields 'W' never explicitly touches.
+    // model=="" is the explicit/default "no lens" state -- quiet, not an
+    // error. A model that doesn't resolve to a real file is NOT an error
+    // either (graceful "continue without distortion correction", never
+    // aborts the run) -- only a found-but-malformed file prints a sharper
+    // diagnostic, from lens_calib_load() itself.
+    auto load_lens_for_slot = [&](int i, const std::string &model) -> bool {
+        BevSlotConfig &sc = cfg.slots[cfg_slots[i]];
+        if (model.empty()) {
+            sc.lens_model = "";
+            sc.has_distortion = false;
+            push_distortion(i, sc);
+            return true;
+        }
+        std::string path = lens_calib_path(lens_dir, model);
+        BevSlotConfig trial;
+        if (!lens_calib_load(path, trial)) {
+            std::printf("[multi] no lens calibration found for '%s' (%s) -- "
+                        "slot %d continuing without distortion correction\n",
+                        model.c_str(), path.c_str(), cfg_slots[i] + 1);
+            return false;
+        }
+        sc.lens_model = model;
+        sc.fx = trial.fx; sc.fy = trial.fy; sc.cx = trial.cx; sc.cy = trial.cy;
+        sc.k1 = trial.k1; sc.k2 = trial.k2; sc.k3 = trial.k3;
+        sc.p1 = trial.p1; sc.p2 = trial.p2;
+        sc.lens_calib_w = trial.lens_calib_w;
+        sc.lens_calib_h = trial.lens_calib_h;
+        sc.has_distortion = true;
+        push_distortion(i, sc);
+        std::printf("[multi] slot %d lens '%s' -> %s (distortion correction ON)\n",
+                    cfg_slots[i] + 1, model.c_str(), path.c_str());
+        return true;
+    };
+
+    for (int i = 0; i < n; ++i)
+        load_lens_for_slot(i, cfg.slots[cfg_slots[i]].lens_model);
+
     rebuild_all("init");
 
     enable_raw_stdin();
@@ -613,8 +711,10 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     float       overlap_deg  = cfg.overlap_deg; // degrees, angular half-width (see BEV_ALGORITHM.md)
     float       blend_edge   = cfg.blend_edge;
     bool        in_path_edit = false;
+    bool        in_lens_edit = false;
     bool        free_yaw     = false; // 'F' toggle -- see GpuRenderer::set_free_yaw()
     std::string path_buf;
+    std::string lens_buf;
     renderer.set_stitch_overlap(overlap_deg);
     renderer.set_blend_edge(blend_edge);
     renderer.set_coverage_weight(blend_mode == BlendMode::Coverage);
@@ -628,9 +728,11 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
     std::printf(
         "[keys] s=snapshot  +/-=overlap(deg)  [/]=sharpness  c=sanity-check  "
         "F=toggle free-yaw\n"
-        "       1..%d=select slot  E=edit path\n"
+        "       1..%d=select slot  E=edit path  L=edit lens_model\n"
         "       H/h=height+-  P/p=pitch+-  Y/y=yaw+-  G/g=cam_y+-  X/x=cam_x+-  "
-        "M/m=px_per_m+- (global)  W=save as default  Ctrl+C=stop\n", n);
+        "M/m=px_per_m+- (global)\n"
+        "       B/b=car_x+-  N/n=car_y+- (global, car icon)  "
+        "W=save as default  Ctrl+C=stop\n", n);
 
     uint64_t total_frames = 0;
     double   next_due     = now_ms();
@@ -680,6 +782,11 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                         slots[active_slot].path  = path_buf;
                         slots[active_slot].frame = slots[active_slot].src->nextFrame();
                         rebuild_slot(active_slot, "path");
+                        // A differently-sized video changes this slot's own
+                        // frame width/height, which the normalized fx/fy/cx/cy
+                        // distortion uniforms were rescaled for -- re-push so
+                        // they don't go stale at the wrong scale.
+                        load_lens_for_slot(active_slot, cfg.slots[cfg_slots[active_slot]].lens_model);
                         std::printf("\n[multi] slot %d path -> %s\n",
                                     active_slot + 1, path_buf.c_str());
                     } else {
@@ -698,6 +805,31 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                     }
                 } else if (key >= 0x20 && key < 0x7f) {
                     path_buf += key;
+                    std::fputc(key, stdout);
+                    std::fflush(stdout);
+                }
+            } else if (in_lens_edit) {
+                // Exact structural mirror of in_path_edit above (same
+                // commit/Esc/backspace/echo shape), but the commit action
+                // delegates to load_lens_for_slot() rather than duplicating
+                // lookup logic -- that function already does its own
+                // build-before-swap safety (a scratch BevSlotConfig, only
+                // written into cfg.slots[...] on success).
+                if (key == '\r' || key == '\n') {
+                    std::printf("\n");
+                    load_lens_for_slot(active_slot, lens_buf);
+                    in_lens_edit = false;
+                } else if (key == 0x1b) {
+                    std::printf("\n[multi] lens edit cancelled\n");
+                    in_lens_edit = false;
+                } else if (key == 0x7f || key == 0x08) {
+                    if (!lens_buf.empty()) {
+                        lens_buf.pop_back();
+                        std::fputs("\b \b", stdout);
+                        std::fflush(stdout);
+                    }
+                } else if (key >= 0x20 && key < 0x7f) {
+                    lens_buf += key;
                     std::fputc(key, stdout);
                     std::fflush(stdout);
                 }
@@ -747,6 +879,10 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                 save_cfg.px_per_m    = px_per_m;
                 save_cfg.overlap_deg = overlap_deg;
                 save_cfg.blend_edge  = blend_edge;
+                save_cfg.car_x       = car_x_m;
+                save_cfg.car_y       = car_y_m;
+                save_cfg.car_width   = car_width_m;
+                save_cfg.car_length  = car_length_m;
                 for (int i = 0; i < n; ++i) {
                     const SlotParams &p = slots[i].params;
                     BevSlotConfig    &s = save_cfg.slots[cfg_slots[i]];
@@ -785,6 +921,14 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
                 std::printf("\n[multi] editing slot %d path (current: %s) — "
                             "type new path, Enter=commit, Esc=cancel:\n> ",
                             cfg_slots[active_slot] + 1, slots[active_slot].path.c_str());
+                std::fflush(stdout);
+            } else if (key == 'L' || key == 'l') {
+                in_lens_edit = true;
+                lens_buf.clear();
+                const std::string &cur = cfg.slots[cfg_slots[active_slot]].lens_model;
+                std::printf("\n[multi] editing slot %d lens_model (current: %s) — "
+                            "type new model, Enter=commit, Esc=cancel, empty+Enter=clear:\n> ",
+                            cfg_slots[active_slot] + 1, cur.empty() ? "(none)" : cur.c_str());
                 std::fflush(stdout);
             } else if (key >= '1' && key <= '9') {
                 int idx = key - '1';
@@ -837,6 +981,22 @@ static int run_multi_file_mode(const std::vector<std::string> &paths,
             } else if (key == 'x') {
                 slots[active_slot].params.cam_x = std::max(slots[active_slot].params.cam_x - 0.05, -30.0);
                 rebuild_slot(active_slot, "cam_x-");
+            } else if (key == 'B') {
+                car_x_m = std::min(car_x_m + 0.05, 5.0);
+                renderer.set_car_center((float)car_x_m, (float)car_y_m);
+                std::printf("[multi] car_x=%.2fm car_y=%.2fm\n", car_x_m, car_y_m);
+            } else if (key == 'b') {
+                car_x_m = std::max(car_x_m - 0.05, -5.0);
+                renderer.set_car_center((float)car_x_m, (float)car_y_m);
+                std::printf("[multi] car_x=%.2fm car_y=%.2fm\n", car_x_m, car_y_m);
+            } else if (key == 'N') {
+                car_y_m = std::min(car_y_m + 0.05, 5.0);
+                renderer.set_car_center((float)car_x_m, (float)car_y_m);
+                std::printf("[multi] car_x=%.2fm car_y=%.2fm\n", car_x_m, car_y_m);
+            } else if (key == 'n') {
+                car_y_m = std::max(car_y_m - 0.05, -5.0);
+                renderer.set_car_center((float)car_x_m, (float)car_y_m);
+                std::printf("[multi] car_x=%.2fm car_y=%.2fm\n", car_x_m, car_y_m);
             }
         }
 
@@ -878,11 +1038,41 @@ int main(int argc, char *argv[])
     // over the file's default when passed, hence tracking whether it was.
     std::string config_path        = "bev_config.ini";
     bool        px_per_m_from_cli  = false;
+    // Live camera mode only (the libcamera::CameraManager path at the bottom
+    // of main(), not --src/--forward-*/--file's pre-recorded-video playback,
+    // which never touches libcamera/the ISP at all) -- same mechanism
+    // rpicam-apps's own --tuning-file uses under the hood: libcamera's RPi
+    // pipeline handler reads this env var (once, at CameraManager startup)
+    // to pick a non-default IPA tuning file instead of doing its normal
+    // sensor-name-based lookup. Must be set before the CameraManager exists.
+    std::string tuning_file;
+    // Per-lens-model distortion files (see bev_config.h's lens_calib_load())
+    // are looked up as "<lens_dir>/<lens_model>-lens.ini". Left empty here
+    // and resolved to config_path's own directory once argv parsing is done
+    // (see below) -- travels with wherever --config already points, no new
+    // fixed-subdirectory convention to remember on top of it.
+    std::string lens_dir;
     // --blend pyramid selects the multi-band Laplacian pyramid blend
     // (GpuRenderer::init_multi_pyramid() et al.) instead of the default
     // single-pass angular-weighted "feather" blend (kFS_MULTI) -- --src
     // mode only, a separate/comparable alternative, not a replacement.
     BlendMode   blend_mode = BlendMode::Feather;
+    // Static top-down car icon composited over the BEV canvas's permanently
+    // camera-blind center -- opt-in (no default path/CWD guessing, unlike
+    // config_path's bev_config_defaults() fallback: there's no equivalent
+    // built-in default icon to fall back to), and only matters if --car-icon
+    // is given. Width/length/center default to the config file's car_width/
+    // car_length/car_x/car_y (see bev_config.h) same as --px-per-m does for
+    // px_per_m -- the CLI flags below only override when actually passed.
+    std::string car_icon_path;
+    double      cli_car_width  = 1.8;
+    double      cli_car_length = 4.5;
+    double      cli_car_x      = 0.0;
+    double      cli_car_y      = 0.0;
+    bool        car_width_from_cli  = false;
+    bool        car_length_from_cli = false;
+    bool        car_x_from_cli      = false;
+    bool        car_y_from_cli      = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--file"            && i + 1 < argc) file_path  = argv[++i];
@@ -896,6 +1086,8 @@ int main(int argc, char *argv[])
         else if (a == "--preview") preview_requested = true;
         else if (a == "--bev") bev_requested = true;
         else if (a == "--config"     && i + 1 < argc) config_path = argv[++i];
+        else if (a == "--lens-dir"   && i + 1 < argc) lens_dir    = argv[++i];
+        else if (a == "--tuning-file" && i + 1 < argc) tuning_file = argv[++i];
         else if (a == "--blend"      && i + 1 < argc) {
             std::string mode = argv[++i];
             if (mode == "pyramid") blend_mode = BlendMode::Pyramid;
@@ -912,6 +1104,30 @@ int main(int argc, char *argv[])
             ipm.px_per_m      = std::atof(argv[++i]);
             px_per_m_from_cli = true;
         }
+        else if (a == "--car-icon"   && i + 1 < argc) car_icon_path = argv[++i];
+        else if (a == "--car-width"  && i + 1 < argc) {
+            cli_car_width      = std::atof(argv[++i]);
+            car_width_from_cli = true;
+        }
+        else if (a == "--car-length" && i + 1 < argc) {
+            cli_car_length      = std::atof(argv[++i]);
+            car_length_from_cli = true;
+        }
+        else if (a == "--car-x"      && i + 1 < argc) {
+            cli_car_x      = std::atof(argv[++i]);
+            car_x_from_cli = true;
+        }
+        else if (a == "--car-y"      && i + 1 < argc) {
+            cli_car_y      = std::atof(argv[++i]);
+            car_y_from_cli = true;
+        }
+    }
+
+    // Default --lens-dir to config_path's own directory (falls back to "."
+    // if config_path has no '/') -- only when --lens-dir wasn't passed.
+    if (lens_dir.empty()) {
+        size_t slash = config_path.find_last_of('/');
+        lens_dir = (slash == std::string::npos) ? "." : config_path.substr(0, slash);
     }
 
     // cfg_slots[i] is the bev_config.ini slot that sources[i] reads its
@@ -997,7 +1213,13 @@ int main(int argc, char *argv[])
 
     if (!sources.empty()) {
         int rc = run_multi_file_mode(sources, cfg_slots, active_egl, preview_ptr, ipm.px_per_m,
-                                     px_per_m_from_cli, blend_mode, config_path);
+                                     px_per_m_from_cli, blend_mode, config_path,
+                                     car_icon_path,
+                                     cli_car_width, car_width_from_cli,
+                                     cli_car_length, car_length_from_cli,
+                                     cli_car_x, car_x_from_cli,
+                                     cli_car_y, car_y_from_cli,
+                                     lens_dir);
         teardown_egl(egl);
         return rc;
     }
@@ -1013,6 +1235,14 @@ int main(int argc, char *argv[])
     }
 
     /* ---- Camera init ---- */
+    // Same mechanism rpicam-still/rpicam-vid's --tuning-file uses: libcamera's
+    // RPi pipeline handler reads this env var once, when it starts up, to
+    // load a specific IPA tuning JSON instead of its normal sensor-name-based
+    // default lookup. Must be set before CameraManager exists -- setting it
+    // any later has no effect, the tuning file is only read at startup.
+    if (!tuning_file.empty())
+        setenv("LIBCAMERA_RPI_TUNING_FILE", tuning_file.c_str(), 1);
+
     auto cm = std::make_unique<CameraManager>();
     if (cm->start()) {
         std::cerr << "[capture] CameraManager::start failed\n";

@@ -131,6 +131,10 @@ bool bev_config_load(const std::string &path, BevConfig &out)
                 if      (key == "px_per_m")    out.px_per_m    = std::stod(val);
                 else if (key == "overlap_deg") out.overlap_deg = std::stof(val);
                 else if (key == "blend_edge")  out.blend_edge  = std::stof(val);
+                else if (key == "car_x")       out.car_x       = std::stod(val);
+                else if (key == "car_y")       out.car_y       = std::stod(val);
+                else if (key == "car_width")   out.car_width   = std::stod(val);
+                else if (key == "car_length")  out.car_length  = std::stod(val);
                 else {
                     std::cerr << "[config] " << path << ":" << lineno
                               << ": unknown global key '" << key << "'\n";
@@ -154,6 +158,7 @@ bool bev_config_load(const std::string &path, BevConfig &out)
                         return false;
                     }
                 }
+                else if (key == "lens_model") s.lens_model = val;
                 else if (key == "hb2i") {
                     std::istringstream iss(val);
                     double v[9];
@@ -195,6 +200,10 @@ bool bev_config_save(const std::string &path, const BevConfig &cfg)
     out << "px_per_m = "    << cfg.px_per_m    << "\n";
     out << "overlap_deg = " << cfg.overlap_deg << "\n";
     out << "blend_edge = "  << cfg.blend_edge  << "\n";
+    out << "car_x = "       << cfg.car_x       << "\n";
+    out << "car_y = "       << cfg.car_y       << "\n";
+    out << "car_width = "   << cfg.car_width   << "\n";
+    out << "car_length = "  << cfg.car_length  << "\n";
 
     for (int i = 0; i < BevConfig::kMaxSlots; ++i) {
         const BevSlotConfig &s = cfg.slots[i];
@@ -213,6 +222,80 @@ bool bev_config_save(const std::string &path, const BevConfig &cfg)
             for (double v : s.hb2i.m) out << " " << v;
             out << "\n";
         }
+        // Only lens_model is persisted (the empty string IS the "unset"
+        // sentinel, same role has_hb2i's bool plays for hb2i) -- fx/fy/../
+        // k1../lens_calib_w/h are deliberately never written here, see
+        // BevSlotConfig::lens_model's comment.
+        if (!s.lens_model.empty())
+            out << "lens_model = " << s.lens_model << "\n";
     }
     return (bool)out;
+}
+
+bool lens_calib_load(const std::string &path, BevSlotConfig &slot)
+{
+    std::ifstream in(path);
+    if (!in.is_open()) return false; // not calibrated yet -- caller decides what to print
+
+    bool have_fx = false, have_fy = false, have_cx = false, have_cy = false;
+    bool have_w  = false, have_h  = false;
+    BevSlotConfig trial; // build into a scratch copy -- don't touch slot until fully valid
+
+    std::string raw;
+    int lineno = 0;
+    while (std::getline(in, raw)) {
+        ++lineno;
+        std::string line = trim(raw);
+        if (line.empty() || line[0] == '#') continue;
+
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            std::cerr << "[lens] " << path << ":" << lineno
+                      << ": expected 'key = value', got '" << line << "'\n";
+            return false;
+        }
+        std::string key = trim(line.substr(0, eq));
+        std::string val = trim(line.substr(eq + 1));
+
+        try {
+            if      (key == "fx") { trial.fx = std::stod(val); have_fx = true; }
+            else if (key == "fy") { trial.fy = std::stod(val); have_fy = true; }
+            else if (key == "cx") { trial.cx = std::stod(val); have_cx = true; }
+            else if (key == "cy") { trial.cy = std::stod(val); have_cy = true; }
+            else if (key == "k1") trial.k1 = std::stod(val);
+            else if (key == "k2") trial.k2 = std::stod(val);
+            else if (key == "k3") trial.k3 = std::stod(val);
+            else if (key == "p1") trial.p1 = std::stod(val);
+            else if (key == "p2") trial.p2 = std::stod(val);
+            else if (key == "calib_w") { trial.lens_calib_w = std::stoi(val); have_w = true; }
+            else if (key == "calib_h") { trial.lens_calib_h = std::stoi(val); have_h = true; }
+            else {
+                std::cerr << "[lens] " << path << ":" << lineno
+                          << ": unknown key '" << key << "'\n";
+                return false;
+            }
+        } catch (const std::exception &) {
+            std::cerr << "[lens] " << path << ":" << lineno
+                      << ": malformed number in '" << line << "'\n";
+            return false;
+        }
+    }
+
+    if (!(have_fx && have_fy && have_cx && have_cy && have_w && have_h)) {
+        std::cerr << "[lens] " << path
+                  << ": missing required key(s) -- need fx, fy, cx, cy, calib_w, calib_h\n";
+        return false;
+    }
+
+    // Copy only the distortion-related fields -- slot may already carry real
+    // pose/hb2i/lens_model data (this is called with the live slot, or a
+    // scratch one main.cpp fills in separately), which a wholesale
+    // `slot = trial` would clobber back to BevSlotConfig{}'s defaults.
+    slot.fx = trial.fx; slot.fy = trial.fy; slot.cx = trial.cx; slot.cy = trial.cy;
+    slot.k1 = trial.k1; slot.k2 = trial.k2; slot.k3 = trial.k3;
+    slot.p1 = trial.p1; slot.p2 = trial.p2;
+    slot.lens_calib_w = trial.lens_calib_w;
+    slot.lens_calib_h = trial.lens_calib_h;
+    slot.has_distortion = true;
+    return true;
 }

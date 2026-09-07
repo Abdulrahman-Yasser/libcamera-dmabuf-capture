@@ -123,6 +123,11 @@ if (HAVE_WAYLAND_PREVIEW)
         TARGET libcamera-dmabuf-capture)
 endif ()
 
+# Header-only (github.com/nothings/stb, vendored as a git submodule) -- used
+# for the car icon's image load (gpu_renderer.cpp's read_png_rgba()); no
+# library to link, just needs its directory on the include path.
+target_include_directories(libcamera-dmabuf-capture PRIVATE extern/stb)
+
 target_link_libraries(libcamera-dmabuf-capture PRIVATE
     PkgConfig::LIBCAMERA
     PkgConfig::DRM

@@ -4,6 +4,14 @@
 #include <drm/drm_fourcc.h>
 #include <png.h>
 
+// Single-header image loader (github.com/nothings/stb, vendored as a git
+// submodule at extern/stb) -- used only for the car icon's PNG/JPEG/etc.
+// load (read_png_rgba() below). save_snapshot() further down still uses
+// libpng directly for the *write* side; stb_image is read-only, so it can't
+// replace that half.
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -223,6 +231,16 @@ uniform mat3  uH[MAX_CAMERAS];
 // Each camera's facing bearing, degrees, world atan2(Y,X) convention
 // (derived from that camera's yaw — see BEV_ALGORITHM.md).
 uniform float uFacingDeg[MAX_CAMERAS];
+// Per-camera lens distortion correction (see bev_config.h's
+// lens_calib_load()/BevSlotConfig comment for where these numbers come
+// from). fx/fy/cx/cy (uDist0) are pre-normalized by the CPU caller into
+// [0,1] uv terms -- not raw pixel values. k1/k2/k3 (radial, uDist1.xyz) and
+// p1/p2 (tangential, uDist1.w/uDist2.x) follow the standard OpenCV
+// distortion-model convention. uDist2.y > 0.5 gates the correction on;
+// default (0) skips it entirely, reproducing today's undistorted behavior.
+uniform vec4  uDist0[MAX_CAMERAS]; // fx, fy, cx, cy
+uniform vec4  uDist1[MAX_CAMERAS]; // k1, k2, k3, p1
+uniform vec2  uDist2[MAX_CAMERAS]; // p2, hasDistortion
 uniform int   uNumCameras;
 
 // BEV canvas size in pixels (matches the FBO/render size; set once at
@@ -275,6 +293,17 @@ const float kPi = 3.14159265358979;
     if (IDX < uNumCameras) {                                                 \
         vec3 s  = uH[IDX] * p;                                              \
         vec2 uv = s.xy / s.z;                                               \
+        if (uDist2[IDX].y > 0.5) {                                          \
+            vec4 d0 = uDist0[IDX]; vec4 d1 = uDist1[IDX];                   \
+            float p2v = uDist2[IDX].x;                                     \
+            float x = (uv.x - d0.z) / d0.x;                                \
+            float y = (uv.y - d0.w) / d0.y;                                \
+            float r2 = x*x + y*y;                                          \
+            float radial = 1.0 + d1.x*r2 + d1.y*r2*r2 + d1.z*r2*r2*r2;      \
+            float xd = x*radial + 2.0*d1.w*x*y + p2v*(r2 + 2.0*x*x);        \
+            float yd = y*radial + d1.w*(r2 + 2.0*y*y) + 2.0*p2v*x*y;        \
+            uv = vec2(d0.x*xd + d0.z, d0.y*yd + d0.w);                     \
+        }                                                                    \
         bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))         \
                             && all(lessThanEqual(uv, vec2(1.0)));           \
         if (ok) {                                                           \
@@ -351,6 +380,58 @@ void main() {
 }
 )glsl";
 
+// ── Car icon overlay ─────────────────────────────────────────────────────────
+//
+// Composites a static top-down car PNG over the BEV canvas center -- the one
+// region every camera's own homography always excludes, since it's where the
+// vehicle itself physically sits (no camera mounted on the car can see
+// under/through it). kFS_MULTI's own weightSum==0 fallback just leaves that
+// region black; draw_car_icon() (called after either render_frame_multi() or
+// render_frame_multi_pyramid() finishes) draws over it as one more pass.
+//
+// gl_VertexID-indexed 4-vertex quad, no VBO -- same style kVS above uses for
+// its full-screen triangle, pattern-matched from wayland_window.cpp's
+// kQuadVS/kQuadFS (that one runs in the separate --preview compositor pass,
+// not before fbo_tex_ readback, so it can't be reused directly here). uScale
+// is a pure per-axis NDC scale, no offset uniform needed, since the world
+// origin the vehicle sits at is by construction also the BEV canvas center
+// (BEV_ALGORITHM.md §3) -- which for a viewport-filling quad is also NDC
+// (0,0). See GpuRenderer::init_car_icon()/set_px_per_m() for how uScale gets
+// computed from real vehicle width/length in meters.
+static const char kVS_CAR[] = R"glsl(
+#version 300 es
+uniform vec2 uScale;
+// NDC offset from canvas center -- world-meter center_x_m/center_y_m
+// (GpuRenderer::init_car_icon()) converted the same way uScale converts
+// half-width/half-length, recomputed alongside it in set_px_per_m(). Zero
+// for a rig whose calibrated center already matches the canvas center.
+uniform vec2 uCenter;
+out vec2 vUV;
+void main() {
+    const vec2 pos[4] = vec2[4](
+        vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2(-1.0, 1.0), vec2( 1.0, 1.0)
+    );
+    vec2 p = pos[gl_VertexID];
+    // PNG row 0 (v=0) is the car's front; quad top (p.y=+1) is world-forward
+    // (BEV_ALGORITHM.md's top-origin py convention: visual top of the
+    // rendered/saved image is world +Y). Standard vUV = p*0.5+0.5 would put
+    // texture v=1 (the PNG's LAST row = the car's rear) at the quad's top
+    // instead -- backwards -- so this flips v to put v=0 (PNG top = car
+    // front) at p.y=+1 (quad top = world-forward).
+    vUV = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);
+    gl_Position = vec4(p * uScale + uCenter, 0.0, 1.0);
+}
+)glsl";
+
+static const char kFS_CAR[] = R"glsl(
+#version 300 es
+precision mediump float;
+uniform sampler2D uTex;
+in  vec2 vUV;
+out vec4 fragColor;
+void main() { fragColor = texture(uTex, vUV); }
+)glsl";
+
 // ── Multi-band (Laplacian pyramid) blend, N-camera surround-view ───────────────
 //
 // Second, separate blend option for --src mode, alongside kFS_MULTI's
@@ -384,6 +465,12 @@ uniform sampler2D uTexUV;
 // ground_to_image_H() in ipm.cpp), same convention as kFS_MULTI/kFS_BEV.
 uniform mat3  uH;
 uniform float uFacingDeg;
+// Lens distortion correction -- same convention as kFS_MULTI's uDist0/1/2
+// (see that shader's comment), just non-array since this program draws one
+// camera at a time.
+uniform vec4  uDist0; // fx, fy, cx, cy
+uniform vec4  uDist1; // k1, k2, k3, p1
+uniform vec2  uDist2; // p2, hasDistortion
 
 uniform float uBevWidth;
 uniform float uBevHeight;
@@ -400,6 +487,16 @@ void main() {
     vec3 p = vec3(gl_FragCoord.x, uBevHeight - gl_FragCoord.y, 1.0);
     vec3 s = uH * p;
     vec2 uv = s.xy / s.z;
+
+    if (uDist2.y > 0.5) {
+        float x = (uv.x - uDist0.z) / uDist0.x;
+        float y = (uv.y - uDist0.w) / uDist0.y;
+        float r2 = x*x + y*y;
+        float radial = 1.0 + uDist1.x*r2 + uDist1.y*r2*r2 + uDist1.z*r2*r2*r2;
+        float xd = x*radial + 2.0*uDist1.w*x*y + uDist2.x*(r2 + 2.0*x*x);
+        float yd = y*radial + uDist1.w*(r2 + 2.0*y*y) + 2.0*uDist2.x*x*y;
+        uv = vec2(uDist0.x*xd + uDist0.z, uDist0.y*yd + uDist0.w);
+    }
 
     bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))
                         && all(lessThanEqual(uv, vec2(1.0)));
@@ -647,6 +744,22 @@ static GLuint build_program(const char *vs_src, const char *fs_src)
         return 0;
     }
     return prog;
+}
+
+
+static bool read_png_rgba(const char *path, int &out_w, int &out_h,
+                          std::vector<uint8_t> &out_pixels)
+{
+    int channels = 0;
+    stbi_uc *data = stbi_load(path, &out_w, &out_h, &channels, 4);
+    if (!data) {
+        std::cerr << "[gpu] car icon: cannot load '" << path << "': "
+                  << stbi_failure_reason() << "\n";
+        return false;
+    }
+    out_pixels.assign(data, data + (size_t)out_w * (size_t)out_h * 4);
+    stbi_image_free(data);
+    return true;
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -1111,6 +1224,7 @@ void GpuRenderer::set_ipm(const float H_left[9], const float H_right[9])
 
 void GpuRenderer::set_px_per_m(float v)
 {
+    px_per_m_ = v;   // cached for set_car_center()'s independent recompute
     if (prog_dual_) {
         glUseProgram(prog_dual_);
         glUniform1f(glGetUniformLocation(prog_dual_, "uPxPerM"), v);
@@ -1123,6 +1237,40 @@ void GpuRenderer::set_px_per_m(float v)
         glUseProgram(prog_pyr_warp_);
         glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uPxPerM"), v);
     }
+    if (prog_car_) {
+        // Car icon's uScale depends on px_per_m (ndc_half = half_size_m * v /
+        // canvas_px) -- recomputed here rather than once at init_car_icon()
+        // time so live px_per_m tuning (M/m keys) keeps the icon correctly
+        // scaled against the ground instead of leaving it at whatever size it
+        // was loaded at. This is also where the icon's *initial* uScale gets
+        // set: init_car_icon() itself doesn't set it, deliberately, so there's
+        // no default-px_per_m guess to duplicate/keep in sync with init_multi()/
+        // init_multi_pyramid()'s own default -- the caller (main.cpp) always
+        // calls set_px_per_m() once, unconditionally, during startup.
+        glUseProgram(prog_car_);
+        glUniform2f(glGetUniformLocation(prog_car_, "uScale"),
+                    car_half_w_m_ * v / (float)W_, car_half_l_m_ * v / (float)H_);
+        // Same meters -> NDC conversion as uScale above, just without the /2
+        // (uScale converts a half-*extent*; this converts a full offset) --
+        // 1 NDC unit spans W_/2 (or H_/2) pixels, so offset_m * v pixels
+        // becomes offset_m * v / (W_/2) NDC, i.e. * 2 / W_.
+        glUniform2f(glGetUniformLocation(prog_car_, "uCenter"),
+                    car_center_x_m_ * v * 2.0f / (float)W_,
+                    car_center_y_m_ * v * 2.0f / (float)H_);
+    }
+}
+
+void GpuRenderer::set_car_center(float center_x_m, float center_y_m)
+{
+    if (!prog_car_) return;
+    car_center_x_m_ = center_x_m;
+    car_center_y_m_ = center_y_m;
+    glUseProgram(prog_car_);
+    // Same conversion set_px_per_m() uses, just off the cached px_per_m_
+    // rather than a freshly-passed value, since px_per_m isn't changing here.
+    glUniform2f(glGetUniformLocation(prog_car_, "uCenter"),
+                car_center_x_m_ * px_per_m_ * 2.0f / (float)W_,
+                car_center_y_m_ * px_per_m_ * 2.0f / (float)H_);
 }
 
 void GpuRenderer::render_frame(const DmaBufFrame &left, const DmaBufFrame &right)
@@ -1187,6 +1335,15 @@ bool GpuRenderer::init_multi(const EGLState &egl, int w, int h, int stride, int 
         u_H_multi_[i] = glGetUniformLocation(prog_multi_, name);
         std::snprintf(name, sizeof(name), "uFacingDeg[%d]", i);
         u_facing_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uDist0[%d]", i);
+        u_dist0_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uDist1[%d]", i);
+        u_dist1_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uDist2[%d]", i);
+        u_dist2_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        // Default: no distortion correction (hasDistortion=0), matching
+        // today's undistorted behavior until a lens file is looked up.
+        glUniform2f(u_dist2_multi_[i], 0.0f, 0.0f);
     }
     glUniform1i(glGetUniformLocation(prog_multi_, "uNumCameras"), num_cameras);
 
@@ -1230,6 +1387,54 @@ void GpuRenderer::set_ipm_multi(int slot, const float H[9], float facing_deg)
     glUniform1f(u_facing_multi_[slot], facing_deg);
 }
 
+void GpuRenderer::set_distortion_multi(int slot, bool has_distortion,
+                                       float fx, float fy, float cx, float cy,
+                                       float k1, float k2, float k3, float p1, float p2)
+{
+    if (!prog_multi_ || slot < 0 || slot >= num_cameras_multi_) return;
+    glUseProgram(prog_multi_);
+    glUniform4f(u_dist0_multi_[slot], fx, fy, cx, cy);
+    glUniform4f(u_dist1_multi_[slot], k1, k2, k3, p1);
+    glUniform2f(u_dist2_multi_[slot], p2, has_distortion ? 1.0f : 0.0f);
+}
+
+bool GpuRenderer::init_car_icon(const char *png_path, float width_m, float length_m,
+                                float center_x_m, float center_y_m)
+{
+    int iw = 0, ih = 0;
+    std::vector<uint8_t> pixels;
+    if (!read_png_rgba(png_path, iw, ih, pixels)) return false;
+
+    prog_car_ = build_program(kVS_CAR, kFS_CAR);
+    if (!prog_car_) return false;
+
+    glGenTextures(1, &tex_car_);
+    glBindTexture(GL_TEXTURE_2D, tex_car_);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, iw, ih, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+    car_half_w_m_   = width_m  / 2.0f;
+    car_half_l_m_   = length_m / 2.0f;
+    car_center_x_m_ = center_x_m;
+    car_center_y_m_ = center_y_m;
+
+    glUseProgram(prog_car_);
+    glUniform1i(glGetUniformLocation(prog_car_, "uTex"), 0);
+    // uScale/uCenter are deliberately left unset here (GLSL zero-inits them)
+    // -- the caller (main.cpp) always calls set_px_per_m() once,
+    // unconditionally, during startup right after this, which is what
+    // actually computes and uploads them from the real px_per_m in use. See
+    // set_px_per_m()'s own comment for why: avoids duplicating/keeping in
+    // sync with init_multi()/init_multi_pyramid()'s own default px_per_m.
+
+    std::printf("[gpu] car icon loaded: %s (%dx%d px, %.2fx%.2fm, center %.2f,%.2fm)\n",
+                png_path, iw, ih, width_m, length_m, center_x_m, center_y_m);
+    return true;
+}
+
 void GpuRenderer::render_frame_multi(const std::vector<DmaBufFrame> &frames)
 {
     collect_timer();
@@ -1245,6 +1450,7 @@ void GpuRenderer::render_frame_multi(const std::vector<DmaBufFrame> &frames)
     if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
     glDrawArrays(GL_TRIANGLES, 0, 3);
     if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    draw_car_icon();
     glFlush();
 }
 
@@ -1332,6 +1538,12 @@ bool GpuRenderer::init_multi_pyramid(const EGLState &egl, int w, int h, int stri
     glUniform1f(glGetUniformLocation(prog_pyr_warp_, "uPxPerM"),    100.0f);
     u_H_pyr_loc_      = glGetUniformLocation(prog_pyr_warp_, "uH");
     u_facing_pyr_loc_ = glGetUniformLocation(prog_pyr_warp_, "uFacingDeg");
+    u_dist0_pyr_loc_  = glGetUniformLocation(prog_pyr_warp_, "uDist0");
+    u_dist1_pyr_loc_  = glGetUniformLocation(prog_pyr_warp_, "uDist1");
+    u_dist2_pyr_loc_  = glGetUniformLocation(prog_pyr_warp_, "uDist2");
+    // Default: no distortion correction for any slot until a lens file is
+    // looked up (dist2_pyr_[*][1] -- hasDistortion -- zero-inits to 0 via
+    // the member's own {} initializer, matching prog_multi_'s default).
 
     glUseProgram(prog_pyr_downsample_);
     glUniform1i(glGetUniformLocation(prog_pyr_downsample_, "uSrc"), 0);
@@ -1410,6 +1622,21 @@ void GpuRenderer::set_ipm_multi_pyramid(int slot, const float H[9], float facing
     facing_pyr_[slot] = facing_deg;
 }
 
+void GpuRenderer::set_distortion_multi_pyramid(int slot, bool has_distortion,
+                                               float fx, float fy, float cx, float cy,
+                                               float k1, float k2, float k3, float p1, float p2)
+{
+    if (!prog_pyr_warp_ || slot < 0 || slot >= num_cameras_multi_pyramid_) return;
+    // No GL calls here either -- same deferred-upload contract as
+    // set_ipm_multi_pyramid() above.
+    dist0_pyr_[slot][0] = fx; dist0_pyr_[slot][1] = fy;
+    dist0_pyr_[slot][2] = cx; dist0_pyr_[slot][3] = cy;
+    dist1_pyr_[slot][0] = k1; dist1_pyr_[slot][1] = k2;
+    dist1_pyr_[slot][2] = k3; dist1_pyr_[slot][3] = p1;
+    dist2_pyr_[slot][0] = p2;
+    dist2_pyr_[slot][1] = has_distortion ? 1.0f : 0.0f;
+}
+
 void GpuRenderer::render_frame_multi_pyramid(const std::vector<DmaBufFrame> &frames)
 {
     collect_timer();
@@ -1441,6 +1668,11 @@ void GpuRenderer::render_frame_multi_pyramid(const std::vector<DmaBufFrame> &fra
         glBindTexture(GL_TEXTURE_2D, tex_uv_pyr_[i]);
         glUniformMatrix3fv(u_H_pyr_loc_, 1, GL_FALSE, H_pyr_[i]);
         glUniform1f(u_facing_pyr_loc_, facing_pyr_[i]);
+        glUniform4f(u_dist0_pyr_loc_, dist0_pyr_[i][0], dist0_pyr_[i][1],
+                   dist0_pyr_[i][2], dist0_pyr_[i][3]);
+        glUniform4f(u_dist1_pyr_loc_, dist1_pyr_[i][0], dist1_pyr_[i][1],
+                   dist1_pyr_[i][2], dist1_pyr_[i][3]);
+        glUniform2f(u_dist2_pyr_loc_, dist2_pyr_[i][0], dist2_pyr_[i][1]);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_2D, tex_pyr_gauss_[i][0], 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
@@ -1511,7 +1743,26 @@ void GpuRenderer::render_frame_multi_pyramid(const std::vector<DmaBufFrame> &fra
     }
 
     if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    draw_car_icon();
     glFlush();
+}
+
+void GpuRenderer::draw_car_icon()
+{
+    if (!prog_car_) return;
+    // Explicit re-establishment rather than trusting the caller's last
+    // state, same defensive pattern every render_frame*() variant uses
+    // (doc 08) -- the reconstruction loop just above leaves the viewport at
+    // level 0's size, which happens to already be W_xH_, but this shouldn't
+    // rely on that happening to be true.
+    glViewport(0, 0, W_, H_);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(prog_car_);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_car_);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glDisable(GL_BLEND);
 }
 
 bool GpuRenderer::save_snapshot(const char *path)
@@ -1589,6 +1840,8 @@ void GpuRenderer::cleanup()
     if (prog_dual_) { glDeleteProgram(prog_dual_);            prog_dual_ = 0; }
     if (prog_bev_)  { glDeleteProgram(prog_bev_);             prog_bev_  = 0; }
     if (prog_multi_) { glDeleteProgram(prog_multi_);          prog_multi_ = 0; }
+    if (prog_car_)  { glDeleteProgram(prog_car_);            prog_car_  = 0; }
+    if (tex_car_)   { glDeleteTextures(1, &tex_car_);        tex_car_   = 0; }
     if (tex_y_)     { glDeleteTextures(1, &tex_y_);          tex_y_     = 0; }
     if (tex_uv_)    { glDeleteTextures(1, &tex_uv_);         tex_uv_    = 0; }
     if (tex_y2_)    { glDeleteTextures(1, &tex_y2_);         tex_y2_    = 0; }
