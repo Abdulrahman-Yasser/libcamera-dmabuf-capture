@@ -6,3 +6,5 @@ README.md
 README.md
 README.md
 *.md
+scripts/__pycache__/calibrate_intrinsics.cpython-310.pyc
+extern/

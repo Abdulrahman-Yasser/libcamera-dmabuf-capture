@@ -107,6 +107,20 @@ public:
     // BEV_ALGORITHM.md's yaw->facing formula) — cheap, called per keypress
     // for just the changed slot, not all N.
     void set_ipm_multi(int slot, const float H[9], float facing_deg);
+    // Per-camera lens distortion correction (radial k1/k2/k3 + tangential
+    // p1/p2, applied around principal point cx/cy with focal length
+    // fx/fy) -- see bev_config.h's lens_calib_load()/BevSlotConfig comment
+    // for where these numbers come from. fx/fy/cx/cy must already be
+    // normalized by the caller (divided by that camera's own frame
+    // width/height) -- NOT the raw pixel values a lens file stores; this
+    // keeps the shader/API entirely in [0,1] uv terms with no separate
+    // image-size uniforms needed. has_distortion=false (the default state,
+    // no lens configured/found) skips the correction in the shader
+    // entirely, reproducing today's exact undistorted behavior at zero
+    // cost. Same cheap, per-keypress/per-lookup contract as set_ipm_multi().
+    void set_distortion_multi(int slot, bool has_distortion,
+                              float fx, float fy, float cx, float cy,
+                              float k1, float k2, float k3, float p1, float p2);
     int  num_cameras_multi() const { return num_cameras_multi_; }
 
     // Loads a top-down car PNG (RGBA, transparent background, front at image
@@ -114,13 +128,22 @@ public:
     // draw_car_icon() can composite it -- correctly scaled -- over the BEV
     // canvas's permanently camera-blind center (no camera mounted on the
     // vehicle can see under/through it, so that region is otherwise always
-    // black -- see kFS_MULTI's weightSum==0 fallback). Returns false (the
-    // renderer keeps working, just without the icon) if the file can't be
-    // read -- this is a cosmetic overlay, not required for rendering to
-    // function. Composited by draw_car_icon() from both render_frame_multi()
-    // and render_frame_multi_pyramid()'s tails (both write to fbo_tex_), so
-    // it shows up under every --blend mode.
-    bool init_car_icon(const char *png_path, float width_m, float length_m);
+    // black -- see kFS_MULTI's weightSum==0 fallback). center_x_m/center_y_m
+    // offset that placement (world meters, same X-right/Y-forward convention
+    // as everything else -- BEV_ALGORITHM.md §3) away from the canvas center,
+    // for a rig whose calibrated center doesn't quite match it; 0,0 keeps the
+    // icon exactly centered, the prior behavior. Returns false (the renderer
+    // keeps working, just without the icon) if the file can't be read --
+    // this is a cosmetic overlay, not required for rendering to function.
+    // Composited by draw_car_icon() from both render_frame_multi() and
+    // render_frame_multi_pyramid()'s tails (both write to fbo_tex_), so it
+    // shows up under every --blend mode.
+    bool init_car_icon(const char *png_path, float width_m, float length_m,
+                       float center_x_m = 0.0f, float center_y_m = 0.0f);
+    // Live re-center, e.g. from a keypress -- cheap, recomputes just the
+    // uCenter uniform (see kVS_CAR) from the last px_per_m set_px_per_m()
+    // saw. No-op if init_car_icon() was never called/failed.
+    void set_car_center(float center_x_m, float center_y_m);
 
     // N-camera surround-view BEV, multi-band (Laplacian pyramid) blend —
     // a separate, comparable alternative to init_multi()/render_frame_multi()
@@ -147,6 +170,14 @@ public:
     void render_frame_multi_pyramid(const std::vector<DmaBufFrame> &frames);
     // Same cheap, per-keypress contract as set_ipm_multi().
     void set_ipm_multi_pyramid(int slot, const float H[9], float facing_deg);
+    // Same contract as set_distortion_multi() (see its comment), for the
+    // pyramid warp pass. No GL calls here -- stores into the CPU-side
+    // dist{0,1,2}_pyr_ arrays, same as set_ipm_multi_pyramid() does for
+    // H_pyr_/facing_pyr_; actual upload happens per-camera inside
+    // render_frame_multi_pyramid().
+    void set_distortion_multi_pyramid(int slot, bool has_distortion,
+                                      float fx, float fy, float cx, float cy,
+                                      float k1, float k2, float k3, float p1, float p2);
     int  num_cameras_multi_pyramid() const { return num_cameras_multi_pyramid_; }
 
     bool save_snapshot(const char *path);
@@ -210,6 +241,14 @@ private:
     GLuint tex_uv_multi_[kMaxCameras] = {};
     GLint  u_H_multi_[kMaxCameras]      = {};
     GLint  u_facing_multi_[kMaxCameras] = {};
+    // Per-camera lens distortion uniforms, packed as 3 uniforms/slot
+    // instead of 9-10 loose floats (uDist0=fx,fy,cx,cy; uDist1=k1,k2,k3,p1;
+    // uDist2=p2,hasDistortion) -- consistent with uH already being one
+    // packed mat3 rather than 9 separate uniforms, and halves the
+    // glGetUniformLocation calls in init_multi()'s per-camera loop.
+    GLint  u_dist0_multi_[kMaxCameras] = {};
+    GLint  u_dist1_multi_[kMaxCameras] = {};
+    GLint  u_dist2_multi_[kMaxCameras] = {};
     int    num_cameras_multi_ = 0;
 
     // Car icon overlay (draw_car_icon()) -- own tiny program/texture, no
@@ -218,6 +257,13 @@ private:
     GLuint tex_car_      = 0;
     float  car_half_w_m_ = 0.0f;   // vehicle width  / 2, meters
     float  car_half_l_m_ = 0.0f;   // vehicle length / 2, meters
+    float  car_center_x_m_ = 0.0f; // world-meter offset from canvas center
+    float  car_center_y_m_ = 0.0f;
+    // Last px_per_m set_px_per_m() saw -- cached so set_car_center() can
+    // recompute uCenter independently (e.g. from a keypress) without the
+    // caller having to re-pass px_per_m every time, symmetric with
+    // car_half_w_m_/car_half_l_m_ already being cached for the same reason.
+    float  px_per_m_ = 100.0f;
 
     // N-camera surround-view, multi-band (Laplacian pyramid) blend mode.
     // Own programs and own per-camera source textures — deliberately
@@ -261,6 +307,17 @@ private:
     // once in init_multi_pyramid() and never touched again, so needs no
     // cached location.
     GLint u_pyr_texel_loc_ = -1;
+
+    // Lens distortion for the pyramid warp pass -- same packed-3-uniforms
+    // shape as u_dist{0,1,2}_multi_ above, but (like u_H_pyr_loc_/H_pyr_)
+    // only ONE cached location each (the warp program draws one camera at a
+    // time, reusing the same uniform across N draws), with per-slot VALUES
+    // kept on the CPU and re-uploaded per-camera inside
+    // render_frame_multi_pyramid().
+    GLint u_dist0_pyr_loc_ = -1, u_dist1_pyr_loc_ = -1, u_dist2_pyr_loc_ = -1;
+    float dist0_pyr_[kPyramidMaxCameras][4] = {}; // fx,fy,cx,cy
+    float dist1_pyr_[kPyramidMaxCameras][4] = {}; // k1,k2,k3,p1
+    float dist2_pyr_[kPyramidMaxCameras][2] = {}; // p2,hasDistortion
 
     int num_cameras_multi_pyramid_ = 0;
     int num_levels_multi_pyramid_  = 0;

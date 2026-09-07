@@ -35,6 +35,30 @@ struct BevSlotConfig {
     // discard whatever offset had been tuned in, even though the raw numbers
     // still landed correctly in the file.
     double cam_x_delta = 0.0, cam_y_delta = 0.0, yaw_delta = 0.0;
+
+    // Which lens this slot uses, looked up by naming convention as
+    // "<lens_dir>/<lens_model>-lens.ini" (see lens_calib_load() and
+    // main.cpp's lens_calib_path()). Empty = no lens configured, the
+    // default/harmless case (no distortion correction applied). This is
+    // the only lens-related field persisted by bev_config_load()/_save() --
+    // fx/fy/../k1../lens_calib_w/h below are re-read from that file every
+    // startup and every runtime hot-swap ('L' key), so the lens file stays
+    // the single source of truth and can be recalibrated without
+    // bev_config.ini silently going stale.
+    std::string lens_model;
+
+    // Populated by a successful lens_calib_load() lookup; meaningless unless
+    // has_distortion is true. fx/fy/cx/cy are in pixel units at
+    // lens_calib_w x lens_calib_h (the resolution they were measured at --
+    // main.cpp rescales+normalizes them for whatever resolution the actual
+    // video turns out to be, same idea as measured_H()'s CAL_W/CAL_H
+    // rescale for hb2i). k1/k2/k3 (radial) and p1/p2 (tangential) follow the
+    // standard OpenCV distortion-model convention, matching
+    // scripts/calibrate_intrinsics.py's own dist-coefficient ordering.
+    double fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0;
+    double k1 = 0.0, k2 = 0.0, k3 = 0.0, p1 = 0.0, p2 = 0.0;
+    int    lens_calib_w = 0, lens_calib_h = 0;
+    bool   has_distortion = false;
 };
 
 struct BevConfig {
@@ -76,6 +100,18 @@ struct BevConfig {
     float         overlap_deg = 350.0f;
     float         blend_edge  = 0.45f;
     BevSlotConfig slots[kMaxSlots];
+
+    // Car icon overlay (see GpuRenderer::init_car_icon()/draw_car_icon()) --
+    // world-meter position offset from the BEV canvas center (the vehicle's
+    // own world origin, BEV_ALGORITHM.md §3) plus its real width/length in
+    // meters. car_x/car_y stay 0 for a rig whose calibrated center already
+    // matches the canvas center; nonzero nudges the icon to correct for a
+    // mismatch instead of touching the geometry itself. --car-x/--car-y/
+    // --car-width/--car-length on the command line override these.
+    double car_x      = 0.0;
+    double car_y      = 0.0;
+    double car_width  = 1.8;
+    double car_length = 4.5;
 };
 
 // Built-in fallback: the original hand-tuned front/right/back/left starting
@@ -91,3 +127,16 @@ bool bev_config_load(const std::string &path, BevConfig &out);
 
 // Overwrites path with cfg, in the same format bev_config_load() reads.
 bool bev_config_save(const std::string &path, const BevConfig &cfg);
+
+// Parses a flat key=value lens/intrinsics file (fx, fy, cx, cy, calib_w,
+// calib_h required; k1, k2, k3, p1, p2 optional, default 0.0 -- a
+// --zero-tangent-dist or non-rational-model calibration legitimately has
+// some of these at zero). On success, sets slot's fx/fy/cx/cy/k1../
+// lens_calib_w/h and has_distortion=true; slot is left untouched otherwise.
+// Returns false, with no message printed, if path doesn't exist (the
+// expected/common state before a lens is calibrated -- the caller decides
+// what if anything to print) or with a path:lineno stderr message (same
+// style as bev_config_load()'s) if the file exists but is malformed
+// (missing required key, bad number) -- that case is a real bug worth
+// surfacing, unlike a simply-absent file.
+bool lens_calib_load(const std::string &path, BevSlotConfig &slot);

@@ -151,6 +151,38 @@ def save_yaml(out_path, K, dist, image_w, image_h, rms):
     fs.release()
 
 
+def save_lens_ini(out_path, K, dist, image_w, image_h):
+    """Writes the flat key=value format libcamera-dmabuf-capture's
+    lens_calib_load() (bev_config.cpp) reads, looked up at runtime as
+    "<lens_dir>/<lens_model>-lens.ini" -- so this is the file to hand that
+    naming convention directly, no manual transcription of fx/fy/../k1..
+    needed. calib_w/calib_h record the resolution K/dist were fit at (this
+    run's photos), so the C++ side can correctly rescale onto whatever
+    resolution the actual video turns out to be -- same idea as
+    ipm.cpp/main.cpp's CAL_W/CAL_H rescale for hb2i. dist's first 5
+    coefficients are always k1,k2,p1,p2,k3 regardless of --rational-model
+    (cv2's fixed ordering) -- higher-order rational terms (k4-k6) aren't
+    part of this project's distortion model, so aren't written even if
+    --rational-model produced them."""
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    k1, k2, p1, p2, k3 = (float(v) for v in dist[:5])
+    with open(out_path, "w") as f:
+        f.write("# lens intrinsics/distortion -- written by calibrate_intrinsics.py\n")
+        f.write("# looked up at runtime as <lens_dir>/<lens_model>-lens.ini\n\n")
+        f.write(f"fx = {fx:.7g}\n")
+        f.write(f"fy = {fy:.7g}\n")
+        f.write(f"cx = {cx:.7g}\n")
+        f.write(f"cy = {cy:.7g}\n")
+        f.write(f"k1 = {k1:.7g}\n")
+        f.write(f"k2 = {k2:.7g}\n")
+        f.write(f"k3 = {k3:.7g}\n")
+        f.write(f"p1 = {p1:.7g}\n")
+        f.write(f"p2 = {p2:.7g}\n")
+        f.write(f"calib_w = {image_w}\n")
+        f.write(f"calib_h = {image_h}\n")
+
+
 def render_undistort_preview(img, K, dist, out_dir, tag):
     h, w = img.shape[:2]
     newK, roi = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=1.0)
@@ -181,6 +213,9 @@ def main():
     ap.add_argument("--fix-principal-point", action="store_true", help="pin principal point to image center")
     ap.add_argument("--out", type=Path, default=None, help="output .npz (default: <images_dir>/intrinsics.npz)")
     ap.add_argument("--yaml", type=Path, default=None, help="also write an OpenCV FileStorage YAML here")
+    ap.add_argument("--lens-out", type=Path, default=None,
+                     help="also write libcamera-dmabuf-capture's lens-ini format here "
+                          "(e.g. imx219-lens.ini) -- see save_lens_ini()")
     ap.add_argument("--out-dir", type=Path, default=None, help="verification images dir (default: images_dir itself)")
     ap.add_argument("--tag", default=None, help="verification image filename tag (default: images_dir's name)")
     ap.add_argument("--no-detections", action="store_true", help="skip writing per-photo corner-overlay debug images")
@@ -289,6 +324,11 @@ def main():
     if args.yaml:
         save_yaml(args.yaml, K, dist, image_size[0], image_size[1], overall_rms)
         print(f"wrote {args.yaml}")
+
+    if args.lens_out:
+        save_lens_ini(args.lens_out, K, dist, image_size[0], image_size[1])
+        print(f"wrote {args.lens_out}  (keys: fx, fy, cx, cy, k1, k2, k3, p1, p2, "
+              f"calib_w, calib_h -- drop straight into --lens-dir)")
 
     best_path = used_paths[int(np.argmax(used_ncorners))]
     best_img = cv2.imread(str(best_path))

@@ -1,3 +1,6 @@
 [submodule "extern/wayland-cxx-scanner"]
 	path = extern/wayland-cxx-scanner
 	url = https://github.com/jwinarske/wayland-cxx-scanner.git
+[submodule "extern/stb"]
+	path = extern/stb
+	url = https://github.com/nothings/stb
