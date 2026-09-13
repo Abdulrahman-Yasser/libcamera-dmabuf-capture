@@ -9,3 +9,4 @@ README.md
 scripts/__pycache__/calibrate_intrinsics.cpython-310.pyc
 extern/
 /*.build/
+/*/__pycache__/
