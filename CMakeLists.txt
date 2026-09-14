@@ -72,7 +72,7 @@ if (HAVE_WAYLAND_PREVIEW)
 
     set(_wl_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/wl-generated")
 endif ()
-
+add_library(pipeline_core SHARED egl_context.cpp capture_session.cpp gpu_renderer.cpp dmabuf_import.cpp file_source.cpp ipm.cpp bev_config.cpp pipeline_runtime.cpp)
 add_executable(libcamera-dmabuf-capture
     main.cpp
     egl_context.cpp
@@ -82,6 +82,7 @@ add_executable(libcamera-dmabuf-capture
     file_source.cpp
     ipm.cpp
     bev_config.cpp
+    pipeline_runtime.cpp
 )
 
 if (HAVE_WAYLAND_PREVIEW)
@@ -142,3 +143,20 @@ target_link_libraries(libcamera-dmabuf-capture PRIVATE
 )
 
 install(TARGETS libcamera-dmabuf-capture DESTINATION bin)
+
+
+
+target_link_libraries(pipeline_core PRIVATE
+    PkgConfig::LIBCAMERA
+    PkgConfig::DRM
+    PkgConfig::GBM
+    PkgConfig::EGL
+    PkgConfig::GLESV2
+    PkgConfig::PNG
+    PkgConfig::GST
+    PkgConfig::GST_APP
+    PkgConfig::GST_ALLOC
+    PkgConfig::GST_VIDEO
+)
+target_include_directories(pipeline_core PRIVATE extern/stb)
+

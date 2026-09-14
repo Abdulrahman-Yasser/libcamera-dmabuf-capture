@@ -1,25 +1,36 @@
-// The camera area in the centre of the screen: the 2x2 grid, a single feed,
-// or the BEV placeholder, with optional guide-line / distance-grid overlays.
-
 import 'package:flutter/material.dart';
 
 import 'models.dart';
 
 class CameraViewport extends StatelessWidget {
-  const CameraViewport({super.key, required this.mode, required this.overlays});
+  const CameraViewport({
+    super.key,
+    required this.mode,
+    required this.overlays,
+    required this.camSubViews,
+    this.frontRearCamera = CameraId.front,
+  });
 
   final ViewMode mode;
   final Set<CameraOverlay> overlays;
+  final CameraId frontRearCamera;
+  final Map<CameraId, CameraSubView> camSubViews;
 
   @override
   Widget build(BuildContext context) {
     final Widget content = switch (mode) {
-      ViewMode.grid => const _Grid(),
-      ViewMode.bev => const BevPlaceholder(),
-      _ => CameraBox(camera: mode.asCamera!, showLabel: true),
+      ViewMode.surround360 => const Surround360Placeholder(),
+      ViewMode.sideViews => _SideViews(subViews: camSubViews),
+      ViewMode.frontRear =>
+        CameraBox(camera: frontRearCamera, showLabel: true),
+      _ => SingleCameraView(
+          camera: mode.asCamera!,
+          subView: camSubViews[mode.asCamera!]!,
+          showLabel: true,
+        ),
     };
 
-    final bool showOverlays = mode != ViewMode.grid;
+    final bool showOverlays = mode != ViewMode.surround360;
 
     return ColoredBox(
       color: const Color(0xFF0A0A0C),
@@ -41,27 +52,49 @@ class CameraViewport extends StatelessWidget {
   }
 }
 
-class _Grid extends StatelessWidget {
-  const _Grid();
+class Surround360Placeholder extends StatelessWidget {
+  const Surround360Placeholder({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return const Column(
+    return const Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          Icon(Icons.threesixty, size: 64, color: Colors.white24),
+          SizedBox(height: 8),
+          Text(
+            '360° panorama\nstitched output goes here',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: Colors.white38, fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SideViews extends StatelessWidget {
+  const _SideViews({required this.subViews});
+
+  final Map<CameraId, CameraSubView> subViews;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
       children: <Widget>[
         Expanded(
-          child: Row(
-            children: <Widget>[
-              Expanded(child: CameraBox(camera: CameraId.front, showLabel: true)),
-              Expanded(child: CameraBox(camera: CameraId.rear, showLabel: true)),
-            ],
+          child: SingleCameraView(
+            camera: CameraId.left,
+            subView: subViews[CameraId.left]!,
+            showLabel: true,
           ),
         ),
         Expanded(
-          child: Row(
-            children: <Widget>[
-              Expanded(child: CameraBox(camera: CameraId.left, showLabel: true)),
-              Expanded(child: CameraBox(camera: CameraId.right, showLabel: true)),
-            ],
+          child: SingleCameraView(
+            camera: CameraId.right,
+            subView: subViews[CameraId.right]!,
+            showLabel: true,
           ),
         ),
       ],
@@ -69,8 +102,69 @@ class _Grid extends StatelessWidget {
   }
 }
 
-/// One camera feed. A bundled placeholder image today; a `Texture` fed by the
-/// libcamera / dmabuf pipeline later — the surrounding layout does not change.
+class SingleCameraView extends StatelessWidget {
+  const SingleCameraView({
+    super.key,
+    required this.camera,
+    required this.subView,
+    this.showLabel = false,
+  });
+
+  final CameraId camera;
+  final CameraSubView subView;
+  final bool showLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    return switch (subView) {
+      CameraSubView.normal => CameraBox(camera: camera, showLabel: showLabel),
+      _ => _CameraSubViewPlaceholder(camera: camera, subView: subView),
+    };
+  }
+}
+
+class _CameraSubViewPlaceholder extends StatelessWidget {
+  const _CameraSubViewPlaceholder({
+    required this.camera,
+    required this.subView,
+  });
+
+  final CameraId camera;
+  final CameraSubView subView;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: const Color(0xFF14141A),
+        border: Border.all(color: Colors.white12),
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(
+              subView == CameraSubView.bev
+                  ? Icons.directions_car
+                  : Icons.crop_free,
+              size: 40,
+              color: Colors.white24,
+            ),
+            const SizedBox(height: 6),
+            Text(
+              '${camera.label} - ${subView.label} placeholder',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.white38, fontSize: 12),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
 class CameraBox extends StatelessWidget {
   const CameraBox({super.key, required this.camera, this.showLabel = false});
 
@@ -131,8 +225,6 @@ class CameraBox extends StatelessWidget {
   }
 }
 
-/// Stand-in for the stitched top-down view: the four feeds arranged around a
-/// vehicle marker, with a note that the real composite lands here.
 class BevPlaceholder extends StatelessWidget {
   const BevPlaceholder({super.key});
 

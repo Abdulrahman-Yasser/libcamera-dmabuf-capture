@@ -1,5 +1,6 @@
 build/
 build-native/
+/compile_commands.json
 libcamera-dmabuf-capture
 *.raw
 README.md
@@ -9,4 +10,5 @@ README.md
 scripts/__pycache__/calibrate_intrinsics.cpython-310.pyc
 extern/
 /*.build/
+/*build/
 /*/__pycache__/

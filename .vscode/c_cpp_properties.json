@@ -1,0 +1,13 @@
+{
+    "configurations": [
+        {
+            "name": "AGL-aarch64",
+            "compileCommands": "${workspaceFolder}/compile_commands.json",
+            "compilerPath": "/opt/agl-sdk/21.90.0-aarch64/sysroots/x86_64-aglsdk-linux/usr/bin/aarch64-agl-linux/aarch64-agl-linux-g++",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-arm64"
+        }
+    ],
+    "version": 4
+}

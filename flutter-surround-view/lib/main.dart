@@ -2,13 +2,9 @@ import 'package:flutter/material.dart';
 
 import 'controls.dart';
 import 'models.dart';
+import 'settings_page.dart';
 import 'viewport.dart';
 
-/// Entry point.
-///
-/// Same shape as the AGL `camera_streams_app` demo: an async `main` that makes
-/// sure the Flutter bindings exist before any plugin / async work runs, then
-/// hands a single root widget to `runApp`.
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const SurroundViewApp());
@@ -30,11 +26,6 @@ class SurroundViewApp extends StatelessWidget {
   }
 }
 
-/// Layout mock.
-///
-/// Every button drives local state here. When the gRPC control channel lands,
-/// each handler sends a request RPC and this state is replaced by whatever the
-/// backend streams back over `WatchState`.
 class SurroundViewScreen extends StatefulWidget {
   const SurroundViewScreen({super.key});
 
@@ -42,8 +33,24 @@ class SurroundViewScreen extends StatefulWidget {
   State<SurroundViewScreen> createState() => _SurroundViewScreenState();
 }
 
+const Set<ViewMode> _fullScreenModes = <ViewMode>{
+  ViewMode.surround360,
+  ViewMode.frontRear,
+};
+
+ViewMode _viewModeForCamera(CameraId camera) => switch (camera) {
+      CameraId.front => ViewMode.front,
+      CameraId.rear => ViewMode.rear,
+      CameraId.left => ViewMode.left,
+      CameraId.right => ViewMode.right,
+    };
+
 class _SurroundViewScreenState extends State<SurroundViewScreen> {
-  ViewMode _mode = ViewMode.grid;
+  ViewMode _mode = ViewMode.surround360;
+  CameraId _frontRearCamera = CameraId.front;
+  final Map<CameraId, CameraSubView> _camSubView = <CameraId, CameraSubView>{
+    for (final CameraId c in CameraId.values) c: CameraSubView.normal,
+  };
   final Set<CameraOverlay> _overlays = <CameraOverlay>{};
   bool _calibrating = false;
   CameraId _calibCamera = CameraId.front;
@@ -58,6 +65,38 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
         SnackBar(content: Text(message), duration: const Duration(seconds: 1)),
       );
   }
+
+  void _cameraTap(CameraId camera) => setState(() {
+        final ViewMode m = _viewModeForCamera(camera);
+        if (_mode == m) {
+          _camSubView[camera] = _camSubView[camera]!.next;
+        } else {
+          _mode = m;
+          _camSubView[camera] = CameraSubView.normal;
+        }
+      });
+
+  void _sideViewsTap() => setState(() {
+        if (_mode == ViewMode.sideViews) {
+          final CameraSubView next = _camSubView[CameraId.left]!.next;
+          _camSubView[CameraId.left] = next;
+          _camSubView[CameraId.right] = next;
+        } else {
+          _mode = ViewMode.sideViews;
+          _camSubView[CameraId.left] = CameraSubView.normal;
+          _camSubView[CameraId.right] = CameraSubView.normal;
+        }
+      });
+
+  void _frontRearTap() => setState(() {
+        if (_mode == ViewMode.frontRear) {
+          _frontRearCamera = _frontRearCamera == CameraId.front
+              ? CameraId.rear
+              : CameraId.front;
+        } else {
+          _mode = ViewMode.frontRear;
+        }
+      });
 
   void _toggleOverlay(CameraOverlay o) => setState(() {
         if (!_overlays.remove(o)) _overlays.add(o);
@@ -75,66 +114,116 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
         }
       });
 
+  void _openSettings() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (BuildContext context) => SettingsPage(
+          initialDeltas: _deltas,
+          onSave: (CameraId camera, CalDelta delta) => setState(() {
+            _deltas[camera] = delta;
+            _toast('Calibration saved for ${camera.label} (mock)');
+          }),
+          onReset: (CameraId camera) => setState(() {
+            _deltas[camera] = CalDelta();
+          }),
+        ),
+      ),
+    );
+  }
+
+  String _modeTagLabel() {
+    if (_mode == ViewMode.frontRear) return '${_frontRearCamera.label} view';
+    final CameraId? cam = _mode.asCamera;
+    if (cam != null) {
+      final CameraSubView sub = _camSubView[cam]!;
+      return sub == CameraSubView.normal
+          ? '${_mode.label} view'
+          : '${_mode.label} - ${sub.label}';
+    }
+    if (_mode == ViewMode.sideViews) {
+      final CameraSubView sub = _camSubView[CameraId.left]!;
+      return sub == CameraSubView.normal
+          ? 'Left + Right view'
+          : 'Left + Right - ${sub.label}';
+    }
+    return '${_mode.label} view';
+  }
+
+  Widget _controlledView() {
+    return Stack(
+      children: <Widget>[
+        Positioned.fill(
+          child: CameraViewport(
+            mode: _mode,
+            overlays: _overlays,
+            camSubViews: _camSubView,
+            frontRearCamera: _frontRearCamera,
+          ),
+        ),
+        Positioned(
+          left: 10,
+          top: 10,
+          child: _ModeTag(label: _modeTagLabel()),
+        ),
+        if (_calibrating)
+          Positioned(
+            left: 10,
+            bottom: 10,
+            child: CalibrationPanel(
+              camera: _calibCamera,
+              delta: _deltas[_calibCamera]!,
+              onSelectCamera: (CameraId c) =>
+                  setState(() => _calibCamera = c),
+              onNudge: _nudge,
+              onSave: () => _toast(
+                'Calibration saved for '
+                '${_calibCamera.label} (mock)',
+              ),
+              onReset: () =>
+                  setState(() => _deltas[_calibCamera] = CalDelta()),
+            ),
+          ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: SafeArea(
-        child: Row(
+        child: Column(
           children: <Widget>[
-            LeftRail(
+            Expanded(
+              child: _fullScreenModes.contains(_mode)
+                  ? _controlledView()
+                  : Row(
+                      children: <Widget>[
+                        Expanded(flex: 7, child: _controlledView()),
+                        const Expanded(
+                          flex: 3,
+                          child: ColoredBox(
+                            color: Color(0xFF0A0A0C),
+                            child: BevPlaceholder(),
+                          ),
+                        ),
+                      ],
+                    ),
+            ),
+            TopToolbar(
+              mode: _mode,
+              onModeChanged: (ViewMode m) => setState(() => _mode = m),
+              camSubViews: _camSubView,
+              onCameraTap: _cameraTap,
+              onSideViewsTap: _sideViewsTap,
+              frontRearCamera: _frontRearCamera,
+              onFrontRearTap: _frontRearTap,
               overlays: _overlays,
               calibrating: _calibrating,
               onToggleOverlay: _toggleOverlay,
               onToggleCalibrate: () =>
                   setState(() => _calibrating = !_calibrating),
               onSnapshot: () => _toast('Snapshot saved (mock)'),
-              onSettings: () => _toast('Settings (mock)'),
-            ),
-            Expanded(
-              child: Column(
-                children: <Widget>[
-                  Expanded(
-                    child: Stack(
-                      children: <Widget>[
-                        Positioned.fill(
-                          child: CameraViewport(
-                            mode: _mode,
-                            overlays: _overlays,
-                          ),
-                        ),
-                        Positioned(
-                          left: 10,
-                          top: 10,
-                          child: _ModeTag(mode: _mode),
-                        ),
-                        if (_calibrating)
-                          Positioned(
-                            left: 10,
-                            bottom: 10,
-                            child: CalibrationPanel(
-                              camera: _calibCamera,
-                              delta: _deltas[_calibCamera]!,
-                              onSelectCamera: (CameraId c) =>
-                                  setState(() => _calibCamera = c),
-                              onNudge: _nudge,
-                              onSave: () => _toast(
-                                'Calibration saved for '
-                                '${_calibCamera.label} (mock)',
-                              ),
-                              onReset: () => setState(
-                                () => _deltas[_calibCamera] = CalDelta(),
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                  BottomBar(
-                    mode: _mode,
-                    onModeChanged: (ViewMode m) => setState(() => _mode = m),
-                  ),
-                ],
-              ),
+              onSettings: _openSettings,
             ),
           ],
         ),
@@ -144,9 +233,9 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
 }
 
 class _ModeTag extends StatelessWidget {
-  const _ModeTag({required this.mode});
+  const _ModeTag({required this.label});
 
-  final ViewMode mode;
+  final String label;
 
   @override
   Widget build(BuildContext context) {
@@ -158,7 +247,7 @@ class _ModeTag extends StatelessWidget {
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         child: Text(
-          '${mode.label} view',
+          label,
           style: const TextStyle(
             color: Colors.white,
             fontSize: 12,

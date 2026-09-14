@@ -5,6 +5,7 @@
 #include "perf_timer.h"
 #include "ipm.h"
 #include "bev_config.h"
+#include "pipeline_runtime.h"
 #ifdef HAVE_WAYLAND_PREVIEW
 #include "wayland_window.h"
 #endif
@@ -99,7 +100,7 @@ using PreviewWindowPtr = WaylandPreviewWindow *;
 using PreviewWindowPtr = void *;
 #endif
 
-static volatile sig_atomic_t g_running = 1;
+ static std::atomic<bool>  g_running = 1;
 
 // Read process RSS (Resident Set Size) from /proc/self/status — cheap, no syscall overhead.
 static long read_rss_kb()
@@ -1234,89 +1235,11 @@ int main(int argc, char *argv[])
         return rc;
     }
 
-    /* ---- Camera init ---- */
-    // Same mechanism rpicam-still/rpicam-vid's --tuning-file uses: libcamera's
-    // RPi pipeline handler reads this env var once, when it starts up, to
-    // load a specific IPA tuning JSON instead of its normal sensor-name-based
-    // default lookup. Must be set before CameraManager exists -- setting it
-    // any later has no effect, the tuning file is only read at startup.
-    if (!tuning_file.empty())
-        setenv("LIBCAMERA_RPI_TUNING_FILE", tuning_file.c_str(), 1);
-
-    auto cm = std::make_unique<CameraManager>();
-    if (cm->start()) {
-        std::cerr << "[capture] CameraManager::start failed\n";
-        teardown_egl(egl); return 1;
+    PipelineState state;
+    if(!pipeline_setup(state, active_egl)){
+        printf("pipeline_setup fail\n");
+        return 1;
     }
-    if (cm->cameras().empty()) {
-        std::cerr << "[capture] no cameras detected\n";
-        cm->stop(); teardown_egl(egl); return 1;
-    }
-
-    std::shared_ptr<Camera> camera = cm->cameras()[0];
-    std::cout << "[capture] camera: " << camera->id() << "\n";
-
-    if (camera->acquire()) {
-        cm->stop(); teardown_egl(egl); return 1;
-    }
-
-    auto config = camera->generateConfiguration({StreamRole::Viewfinder});
-    if (!config) {
-        camera->release(); cm->stop(); teardown_egl(egl); return 1;
-    }
-
-    StreamConfiguration &sc = config->at(0);
-    sc.size        = {1640, 1232};
-    sc.pixelFormat = formats::NV12;
-
-    if (config->validate() == CameraConfiguration::Invalid) {
-        std::cerr << "[capture] no supported format\n";
-        camera->release(); cm->stop(); teardown_egl(egl); return 1;
-    }
-    if (config->validate() == CameraConfiguration::Adjusted)
-        std::cout << "[capture] config adjusted: " << sc.toString() << "\n";
-
-    if (camera->configure(config.get())) {
-        std::cerr << "[capture] configure failed\n";
-        camera->release(); cm->stop(); teardown_egl(egl); return 1;
-    }
-
-    /* ---- Buffer pool: one request per buffer ---- */
-    Stream *stream = sc.stream();
-    FrameBufferAllocator alloc(camera);
-    if (alloc.allocate(stream) < 0) {
-        camera->release(); cm->stop(); teardown_egl(egl); return 1;
-    }
-
-    std::vector<std::unique_ptr<Request>> requests;
-    for (auto &buf : alloc.buffers(stream)) {
-        auto req = camera->createRequest();
-        if (!req || req->addBuffer(stream, buf.get())) {
-            camera->release(); cm->stop(); teardown_egl(egl); return 1;
-        }
-        requests.push_back(std::move(req));
-    }
-    std::printf("[capture] %zu buffer(s) allocated\n", requests.size());
-
-    /* ---- GPU renderer: compile shader + FBO + EGLImage cache ---- */
-    GpuRenderer renderer;
-    if (!renderer.init(active_egl, sc, alloc.buffers(stream))) {
-        camera->release(); cm->stop(); teardown_egl(egl); return 1;
-    }
-
-    /* ---- Camera start + AE/AWB warmup ---- */
-    CaptureSession session(sc, camera.get());
-    camera->requestCompleted.connect(&session, &CaptureSession::requestCompleted);
-    std::cout << "[capture] warming up AE/AWB ("
-              << CaptureSession::WARMUP_FRAMES << " frames)...\n";
-
-    if (camera->start()) {
-        camera->release(); cm->stop(); teardown_egl(egl); return 1;
-    }
-    for (auto &req : requests)
-        camera->queueRequest(req.get());
-
-    session.waitWarmupDone();
 
     /* ---- Continuous render loop ---- */
     enable_raw_stdin();
@@ -1332,65 +1255,7 @@ int main(int argc, char *argv[])
     // CPU time spent inside render_frame() — should be near 0 (just submits to GPU).
     double cpu_render_sum_ms = 0;
 
-    while (g_running) {
-        auto [buf, req] = session.nextFrame();
-        if (!buf) break;
-
-        double t_now        = now_ms();
-        double wall_ms      = t_now - t_prev;
-        t_prev              = t_now;
-
-        double t_r0         = now_ms();
-        renderer.render_frame(buf);
-        double cpu_render_ms = now_ms() - t_r0;
-
-#ifdef HAVE_WAYLAND_PREVIEW
-        // No extra pacing needed here — the camera already paces delivery.
-        if (preview_ptr) {
-            preview_ptr->pump_events();
-            preview_ptr->present(renderer.fbo_texture(), renderer.width(), renderer.height());
-            if (!preview_ptr->running()) g_running = 0;
-        }
-#endif
-
-        // Non-blocking keyboard check — cost is near zero when no key pressed.
-        char key = 0;
-        if (read(STDIN_FILENO, &key, 1) == 1 && (key == 's' || key == 'S')) {
-            static int snap_idx = 0;
-            char path[64];
-            std::snprintf(path, sizeof(path), "/tmp/snapshot_%03d.png", snap_idx++);
-            renderer.save_snapshot(path);
-        }
-
-        req->reuse(Request::ReuseBuffers);
-        camera->queueRequest(req);
-
-        ++fps_frames;
-        ++total_frames;
-
-        // Accumulate wall-clock stats (skip first frame — wall_ms is garbage).
-        if (total_frames > 1) {
-            wall_sum_ms     += wall_ms;
-            if (wall_ms < wall_min_ms) wall_min_ms = wall_ms;
-            if (wall_ms > wall_max_ms) wall_max_ms = wall_ms;
-            cpu_render_sum_ms += cpu_render_ms;
-        }
-
-        // Print FPS + CPU render time + RSS once per second.
-        double t_tick = now_ms();
-        if (t_tick - t_fps >= 1000.0) {
-            double fps     = fps_frames * 1000.0 / (t_tick - t_fps);
-            long   rss_kb  = read_rss_kb();
-            double cpu_avg = total_frames > 1
-                             ? cpu_render_sum_ms / (total_frames - 1) : 0.0;
-            std::printf("[perf] %4.1f fps | render_cpu avg %.3f ms | RSS %ld kB"
-                        " | frames %llu\n",
-                        fps, cpu_avg, rss_kb,
-                        (unsigned long long)total_frames);
-            t_fps      = t_tick;
-            fps_frames = 0;
-        }
-    }
+    pipeline_loop(state, g_running);
 
     std::printf("\n[loop] stopped after %llu frames\n",
                 (unsigned long long)total_frames);
@@ -1456,14 +1321,7 @@ int main(int argc, char *argv[])
     std::printf("=======================================================\n");
 
     /* ---- Cleanup ---- */
-    restore_stdin();
-    session.stop();
-    camera->stop();
-    renderer.cleanup();
-    alloc.free(stream);
-    camera->release();
-    cm->stop();
-    teardown_egl(egl);
+    pipeline_teardown(state, egl);
 
     std::cout << "[exit] clean\n";
     return 0;

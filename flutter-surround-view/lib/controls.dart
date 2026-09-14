@@ -1,9 +1,3 @@
-// The control chrome: a full-height left rail (overlays, snapshot, calibrate,
-// settings), a bottom bar (view-mode segmented control + backend-link pill),
-// and the calibration panel the rail reveals.
-//
-// Layout mock: every callback here is where a gRPC request RPC goes later.
-
 import 'package:flutter/material.dart';
 
 import 'models.dart';
@@ -11,140 +5,55 @@ import 'models.dart';
 const Color _accent = Color(0xFF3D7EFF);
 const Color _barColor = Color(0xFF15151A);
 
-// ---------------------------------------------------------------------------
-// Left rail
-// ---------------------------------------------------------------------------
+enum _QuickAction { guidelines, distanceGrid, snapshot, calibrate }
 
-class LeftRail extends StatelessWidget {
-  const LeftRail({
+class TopToolbar extends StatelessWidget {
+  const TopToolbar({
     super.key,
+    required this.mode,
+    required this.onModeChanged,
+    required this.camSubViews,
+    required this.onCameraTap,
+    required this.onSideViewsTap,
+    required this.frontRearCamera,
+    required this.onFrontRearTap,
     required this.overlays,
     required this.calibrating,
     required this.onToggleOverlay,
     required this.onToggleCalibrate,
     required this.onSnapshot,
     required this.onSettings,
+    this.backendConnected = false,
   });
 
+  final ViewMode mode;
+  final ValueChanged<ViewMode> onModeChanged;
+  final Map<CameraId, CameraSubView> camSubViews;
+  final ValueChanged<CameraId> onCameraTap;
+  final VoidCallback onSideViewsTap;
+  final CameraId frontRearCamera;
+  final VoidCallback onFrontRearTap;
   final Set<CameraOverlay> overlays;
   final bool calibrating;
   final ValueChanged<CameraOverlay> onToggleOverlay;
   final VoidCallback onToggleCalibrate;
   final VoidCallback onSnapshot;
   final VoidCallback onSettings;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      width: 96,
-      color: _barColor,
-      child: Column(
-        children: <Widget>[
-          const SizedBox(height: 10),
-          _RailButton(
-            icon: Icons.timeline,
-            label: 'Guides',
-            active: overlays.contains(CameraOverlay.guidelines),
-            onTap: () => onToggleOverlay(CameraOverlay.guidelines),
-          ),
-          _RailButton(
-            icon: Icons.grid_on,
-            label: 'Distance',
-            active: overlays.contains(CameraOverlay.distanceGrid),
-            onTap: () => onToggleOverlay(CameraOverlay.distanceGrid),
-          ),
-          const Divider(
-            height: 20,
-            indent: 16,
-            endIndent: 16,
-            color: Colors.white12,
-          ),
-          _RailButton(
-            icon: Icons.photo_camera,
-            label: 'Snapshot',
-            onTap: onSnapshot,
-          ),
-          _RailButton(
-            icon: Icons.tune,
-            label: 'Calibrate',
-            active: calibrating,
-            onTap: onToggleCalibrate,
-          ),
-          const Spacer(),
-          _RailButton(
-            icon: Icons.settings,
-            label: 'Settings',
-            onTap: onSettings,
-          ),
-          const SizedBox(height: 10),
-        ],
-      ),
-    );
-  }
-}
-
-class _RailButton extends StatelessWidget {
-  const _RailButton({
-    required this.icon,
-    required this.label,
-    required this.onTap,
-    this.active = false,
-  });
-
-  final IconData icon;
-  final String label;
-  final VoidCallback onTap;
-  final bool active;
-
-  @override
-  Widget build(BuildContext context) {
-    final Color fg = active ? Colors.white : Colors.white70;
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(8, 4, 8, 4),
-      child: Material(
-        color: active ? _accent : Colors.white10,
-        borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          borderRadius: BorderRadius.circular(10),
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 10),
-            child: Column(
-              children: <Widget>[
-                Icon(icon, size: 22, color: fg),
-                const SizedBox(height: 4),
-                Text(label, style: TextStyle(fontSize: 10, color: fg)),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Bottom bar
-// ---------------------------------------------------------------------------
-
-class BottomBar extends StatelessWidget {
-  const BottomBar({
-    super.key,
-    required this.mode,
-    required this.onModeChanged,
-    this.backendConnected = false,
-  });
-
-  final ViewMode mode;
-  final ValueChanged<ViewMode> onModeChanged;
   final bool backendConnected;
 
+  String _camLabel(String base, CameraId camera, bool selected) {
+    final CameraSubView sub = camSubViews[camera]!;
+    if (!selected || sub == CameraSubView.normal) return base;
+    return '$base · ${sub.shortLabel}';
+  }
+
   @override
   Widget build(BuildContext context) {
+    final bool sideViewsSelected = mode == ViewMode.sideViews;
     return Container(
-      height: 76,
+      height: 60,
       color: _barColor,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       child: Row(
         children: <Widget>[
           Expanded(
@@ -152,18 +61,90 @@ class BottomBar extends StatelessWidget {
               scrollDirection: Axis.horizontal,
               child: Row(
                 children: <Widget>[
-                  for (final ViewMode m in ViewMode.values) ...<Widget>[
-                    _SegItem(
-                      label: m.label,
-                      icon: _modeIcon(m),
-                      selected: m == mode,
-                      onTap: () => onModeChanged(m),
+                  _ToolbarButton(
+                    icon: Icons.threesixty,
+                    label: '360 degree',
+                    selected: mode == ViewMode.surround360,
+                    onTap: () => onModeChanged(ViewMode.surround360),
+                  ),
+                  _ToolbarButton(
+                    icon: Icons.arrow_upward,
+                    label: _camLabel(
+                      'Front camera',
+                      CameraId.front,
+                      mode == ViewMode.front,
                     ),
-                    const SizedBox(width: 6),
-                  ],
+                    selected: mode == ViewMode.front,
+                    onTap: () => onCameraTap(CameraId.front),
+                  ),
+                  _ToolbarButton(
+                    icon: Icons.arrow_downward,
+                    label: _camLabel(
+                      'Back camera',
+                      CameraId.rear,
+                      mode == ViewMode.rear,
+                    ),
+                    selected: mode == ViewMode.rear,
+                    onTap: () => onCameraTap(CameraId.rear),
+                  ),
+                  _ToolbarButton(
+                    icon: Icons.arrow_forward,
+                    label: _camLabel(
+                      'Right camera',
+                      CameraId.right,
+                      mode == ViewMode.right,
+                    ),
+                    selected: mode == ViewMode.right,
+                    onTap: () => onCameraTap(CameraId.right),
+                  ),
+                  _ToolbarButton(
+                    icon: Icons.arrow_back,
+                    label: _camLabel(
+                      'Left camera',
+                      CameraId.left,
+                      mode == ViewMode.left,
+                    ),
+                    selected: mode == ViewMode.left,
+                    onTap: () => onCameraTap(CameraId.left),
+                  ),
+                  _ToolbarButton(
+                    icon: Icons.view_column,
+                    label: _camLabel(
+                      'Side views',
+                      CameraId.left,
+                      sideViewsSelected,
+                    ),
+                    selected: sideViewsSelected,
+                    onTap: onSideViewsTap,
+                  ),
+                  _ToolbarButton(
+                    icon: mode == ViewMode.frontRear
+                        ? (frontRearCamera == CameraId.front
+                            ? Icons.arrow_upward
+                            : Icons.arrow_downward)
+                        : Icons.swap_vert,
+                    label: 'Rear/Front cameras',
+                    selected: mode == ViewMode.frontRear,
+                    onTap: onFrontRearTap,
+                  ),
                 ],
               ),
             ),
+          ),
+          const SizedBox(width: 8),
+          _QuickActionsMenu(
+            overlays: overlays,
+            calibrating: calibrating,
+            onToggleOverlay: onToggleOverlay,
+            onToggleCalibrate: onToggleCalibrate,
+            onSnapshot: onSnapshot,
+          ),
+          const SizedBox(width: 8),
+          _ToolbarButton(
+            icon: Icons.settings,
+            label: 'Settings',
+            selected: false,
+            onTap: onSettings,
           ),
           const SizedBox(width: 12),
           _BackendPill(connected: backendConnected),
@@ -173,49 +154,116 @@ class BottomBar extends StatelessWidget {
   }
 }
 
-IconData _modeIcon(ViewMode m) => switch (m) {
-      ViewMode.grid => Icons.grid_view,
-      ViewMode.front => Icons.arrow_upward,
-      ViewMode.rear => Icons.arrow_downward,
-      ViewMode.left => Icons.arrow_back,
-      ViewMode.right => Icons.arrow_forward,
-      ViewMode.bev => Icons.directions_car,
-    };
-
-class _SegItem extends StatelessWidget {
-  const _SegItem({
-    required this.label,
+class _ToolbarButton extends StatelessWidget {
+  const _ToolbarButton({
     required this.icon,
-    required this.selected,
+    required this.label,
     required this.onTap,
+    required this.selected,
   });
 
-  final String label;
   final IconData icon;
-  final bool selected;
+  final String label;
   final VoidCallback onTap;
+  final bool selected;
 
   @override
   Widget build(BuildContext context) {
     final Color fg = selected ? Colors.white : Colors.white70;
-    return Material(
-      color: selected ? _accent : Colors.white10,
-      borderRadius: BorderRadius.circular(8),
-      child: InkWell(
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Material(
+        color: selected ? _accent : Colors.white10,
         borderRadius: BorderRadius.circular(8),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-          child: Row(
-            children: <Widget>[
-              Icon(icon, size: 18, color: fg),
-              const SizedBox(width: 6),
-              Text(
-                label,
-                style: TextStyle(color: fg, fontWeight: FontWeight.w600),
-              ),
-            ],
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: onTap,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Icon(icon, size: 18, color: fg),
+                const SizedBox(width: 6),
+                Text(
+                  label,
+                  style: TextStyle(color: fg, fontWeight: FontWeight.w600, fontSize: 12),
+                ),
+              ],
+            ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+class _QuickActionsMenu extends StatelessWidget {
+  const _QuickActionsMenu({
+    required this.overlays,
+    required this.calibrating,
+    required this.onToggleOverlay,
+    required this.onToggleCalibrate,
+    required this.onSnapshot,
+  });
+
+  final Set<CameraOverlay> overlays;
+  final bool calibrating;
+  final ValueChanged<CameraOverlay> onToggleOverlay;
+  final VoidCallback onToggleCalibrate;
+  final VoidCallback onSnapshot;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopupMenuButton<_QuickAction>(
+      tooltip: 'More',
+      color: const Color(0xFF1B1B21),
+      itemBuilder: (BuildContext context) => <PopupMenuEntry<_QuickAction>>[
+        CheckedPopupMenuItem<_QuickAction>(
+          value: _QuickAction.guidelines,
+          checked: overlays.contains(CameraOverlay.guidelines),
+          child: const Text('Guides'),
+        ),
+        CheckedPopupMenuItem<_QuickAction>(
+          value: _QuickAction.distanceGrid,
+          checked: overlays.contains(CameraOverlay.distanceGrid),
+          child: const Text('Distance grid'),
+        ),
+        CheckedPopupMenuItem<_QuickAction>(
+          value: _QuickAction.calibrate,
+          checked: calibrating,
+          child: const Text('Calibrate'),
+        ),
+        const PopupMenuItem<_QuickAction>(
+          value: _QuickAction.snapshot,
+          child: Text('Snapshot'),
+        ),
+      ],
+      onSelected: (_QuickAction action) {
+        switch (action) {
+          case _QuickAction.guidelines:
+            onToggleOverlay(CameraOverlay.guidelines);
+          case _QuickAction.distanceGrid:
+            onToggleOverlay(CameraOverlay.distanceGrid);
+          case _QuickAction.calibrate:
+            onToggleCalibrate();
+          case _QuickAction.snapshot:
+            onSnapshot();
+        }
+      },
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white10,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        child: const Row(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
+            Icon(Icons.more_horiz, size: 18, color: Colors.white70),
+            SizedBox(width: 2),
+            Icon(Icons.keyboard_arrow_down, size: 16, color: Colors.white70),
+          ],
         ),
       ),
     );
@@ -233,7 +281,7 @@ class _BackendPill extends StatelessWidget {
     return Tooltip(
       message: connected
           ? 'gRPC control link up'
-          : 'gRPC WatchState — not wired yet',
+          : 'gRPC WatchState - not wired yet',
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
@@ -252,10 +300,6 @@ class _BackendPill extends StatelessWidget {
     );
   }
 }
-
-// ---------------------------------------------------------------------------
-// Calibration panel (revealed by the rail's Calibrate button)
-// ---------------------------------------------------------------------------
 
 class CalibrationPanel extends StatelessWidget {
   const CalibrationPanel({
