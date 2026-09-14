@@ -10,7 +10,7 @@
 #include "capture_session.h"
 
 struct PipelineState{
-std::unique_ptr<libcamera::CameraManager>               cm;
+    std::unique_ptr<libcamera::CameraManager>               cm;
     std::shared_ptr<libcamera::Camera>                  camera;
     std::unique_ptr<libcamera::CameraConfiguration>     config;
     libcamera::Stream*                                  stream;

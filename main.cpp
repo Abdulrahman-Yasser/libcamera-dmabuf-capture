@@ -1269,12 +1269,12 @@ int main(int argc, char *argv[])
     // Theoretical memory bandwidth per frame:
     //   Read:  NV12 = W*H*1.5 bytes (Y plane + UV half-res)
     //   Write: RGBA = W*H*4   bytes (FBO color attachment)
-    int W = sc.size.width, H = sc.size.height;
+    int W = state.config->at(0).size.width, H = state.config->at(0).size.height;
     double nv12_mb   = (double)W * H * 1.5 / 1048576.0;
     double rgba_mb   = (double)W * H * 4.0 / 1048576.0;
     double bw_mbps   = (nv12_mb + rgba_mb) * actual_fps;
 
-    const auto &gs   = renderer.gpu_stats();
+    const auto &gs   = state.renderer.gpu_stats();
     double gpu_avg   = gs.frames > 0 ? gs.sum_ms / gs.frames : 0.0;
     double gpu_ceil  = gpu_avg  > 0  ? 1000.0   / gpu_avg    : 0.0;
 
