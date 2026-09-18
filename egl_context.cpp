@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstring>
 #include <iostream>
 
@@ -20,15 +21,15 @@ static bool has_ext(const char *haystack, const char *needle)
     return strstr(haystack, needle) != nullptr;
 }
 
-bool setup_egl(EGLState &egl)
+bool setup_egl(EGLState &egl, const char *render_node)
 {
     /* 1. DRM render node — no display server, no root privileges needed */
-    egl.drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    egl.drm_fd = open(render_node, O_RDWR | O_CLOEXEC);
     if (egl.drm_fd < 0) {
-        perror("[egl] open /dev/dri/renderD128");
+        std::cerr << "[egl] open " << render_node << ": " << strerror(errno) << "\n";
         return false;
     }
-    std::cout << "[egl] opened /dev/dri/renderD128 (fd=" << egl.drm_fd << ")\n";
+    std::cout << "[egl] opened " << render_node << " (fd=" << egl.drm_fd << ")\n";
 
     /* 2. GBM device wraps the DRM fd and lets EGL work without a window */
     egl.gbm_dev = gbm_create_device(egl.drm_fd);

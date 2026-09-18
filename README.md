@@ -581,6 +581,15 @@ The binary is at `build/libcamera-dmabuf-capture`.
 - `glesv2` — OpenGL ES 3.1
 - `libpng` — PNG encoding for snapshots
 
+### ivi-homescreen platform view
+
+The same pipeline also builds as `libbev_view.so`, a platform view for
+ivi-homescreen (`-DENABLE_IHS_PV=ON`), driven from Flutter by the `bev_view`
+package in [`flutter/bev_view`](flutter/bev_view). It renders offscreen and
+hands the shell a dma-buf per frame, on both its EGL and Vulkan backends. The
+native seam lives in `ihs/`; the example app, its run script and the backend
+notes are in [`flutter/bev_view/example`](flutter/bev_view/example/README.md).
+
 ---
 
 ## Deploy and Run
