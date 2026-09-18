@@ -324,6 +324,13 @@ private:
 
     std::unordered_map<int, FrameGLResources> fd_cache_;
 
+    // Allocated size of each system-memory upload texture (upload_nv12), so a
+    // frame of the same size replaces the pixels instead of the storage.
+    // Re-specifying with glTexImage2D every frame frees and reallocates the
+    // texture's buffer 30+ times a second; on V3D that churn surfaced as a
+    // periodic ~120 ms stall shared with the compositor.
+    std::unordered_map<GLuint, std::pair<int, int>> upload_dims_;
+
     // GPU timer query state (GL_EXT_disjoint_timer_query).
     // Single-buffered: at 15–30 fps the GPU finishes long before the next frame.
     GLuint    timer_query_   = 0;

@@ -785,22 +785,30 @@ void GpuRenderer::upload_nv12(const DmaBufFrame &f,
                                GLuint tex_y, GLuint tex_uv,
                                int unit_y, int unit_uv)
 {
+    // Reallocate only when the size changes (a path swap to a different
+    // video); otherwise overwrite the existing storage in place.
+    auto upload = [this](GLuint tex, int unit, GLint internal, GLenum format,
+                         int w, int h, const uint8_t *pixels) {
+        glActiveTexture(GL_TEXTURE0 + unit);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        auto &dims = upload_dims_[tex];
+        if (dims.first != w || dims.second != h) {
+            glTexImage2D(GL_TEXTURE_2D, 0, internal, w, h, 0, format,
+                         GL_UNSIGNED_BYTE, pixels);
+            dims = {w, h};
+        } else {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, format,
+                            GL_UNSIGNED_BYTE, pixels);
+        }
+    };
+
     glPixelStorei(GL_UNPACK_ROW_LENGTH, f.stride);
-    glActiveTexture(GL_TEXTURE0 + unit_y);
-    glBindTexture(GL_TEXTURE_2D, tex_y);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8,
-                 f.width, f.height, 0,
-                 GL_RED, GL_UNSIGNED_BYTE,
-                 f.data + f.y_offset);
+    upload(tex_y, unit_y, GL_R8, GL_RED, f.width, f.height, f.data + f.y_offset);
 
     // UV plane: stride/2 GL_RG pixels per row (2 bytes per pixel).
     glPixelStorei(GL_UNPACK_ROW_LENGTH, f.stride / 2);
-    glActiveTexture(GL_TEXTURE0 + unit_uv);
-    glBindTexture(GL_TEXTURE_2D, tex_uv);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8,
-                 f.width / 2, f.height / 2, 0,
-                 GL_RG, GL_UNSIGNED_BYTE,
-                 f.data + f.uv_offset);
+    upload(tex_uv, unit_uv, GL_RG8, GL_RG, f.width / 2, f.height / 2,
+           f.data + f.uv_offset);
 
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 }
@@ -1824,6 +1832,7 @@ bool GpuRenderer::save_snapshot(const char *path)
 void GpuRenderer::cleanup()
 {
     if (!egl_) return;
+    upload_dims_.clear();
 
     for (auto &[fd, res] : fd_cache_) {
         if (res.texture) glDeleteTextures(1, &res.texture);
