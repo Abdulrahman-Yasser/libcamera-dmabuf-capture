@@ -1,0 +1,30 @@
+name: bev_view_example
+description: Surround-view camera pipeline on ivi-homescreen, as a platform view.
+publish_to: 'none'
+
+environment:
+  sdk: ^3.8.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  bev_view:
+    path: ../
+
+dev_dependencies:
+  flutter_lints: ">=4.0.0 <7.0.0"
+
+flutter:
+  uses-material-design: true
+
+# The native build is configured here -- the hook runner passes no environment
+# through. Uncomment to point at a specific ivi-homescreen build; left alone,
+# CMake probes for a checkout beside this repository.
+#
+# hooks:
+#   user_defines:
+#     bev_view:
+#       ihs_dir: ../../../ivi-homescreen     # relative to flutter/bev_view
+#       ihs_build_dir: cmake-build-debug
+#       enable_vulkan: true
