@@ -96,6 +96,25 @@ ssh <user>@<host> 'cd bev-view && ./run-bev.sh'        # test pattern
 ssh <user>@<host> 'cd bev-view && BEV_MODE=camera ./run-bev.sh'
 ```
 
+`run-bev.sh` finds the output instead of assuming one: it prefers a connected
+DSI panel, falls back to the first connected connector, takes the mode the
+connector reports, and passes `--drm-device`. It has to — a Pi 4 has the DSI
+panel on vc4's card at 800x480, while a Pi 5 drives DSI from a separate
+`rp1-dsi` card at 800x1280 with vc4 holding HDMI, so one hard-coded card or
+geometry is wrong on one of the two. It prints what it picked:
+
+```text
+[run-bev] drm-kms-egl /dev/dri/card1 800x1280 mode=pattern
+```
+
+`DEVICE`, `W` and `H` override it — `DEVICE=/dev/dri/card0 W=1280 H=1024
+./run-bev.sh` drives HDMI on a board where DSI is also connected.
+
+Passing `--backend` twice builds both, and the deploy then lands a **complete
+bundle per backend** — `bev-view/drm-kms-egl/` and `bev-view/drm-kms-vulkan/`,
+each with its own `homescreen`, `lib/` and `data/`. Run from inside one of
+them, and stage `run-bev.sh` into each.
+
 > **`--deploy` prunes the destination.** It rsyncs the bundle and deletes
 > anything it did not put there, so the run script and any hand-staged library
 > (see below) have to be copied **after every deploy**, not once. A run that
@@ -109,7 +128,7 @@ A PiOS *lite* image carries neither of the first two:
 | | |
 |---|---|
 | GStreamer runtime | `sudo apt install libgstreamer1.0-0 libgstreamer-plugins-base1.0-0 gstreamer1.0-libav gstreamer1.0-plugins-good gstreamer1.0-plugins-bad` — `libbev_view.so` links it for the file and surround modes, so without it the library will not load at all |
-| `libdisplay-info` | `sudo apt install libdisplay-info2` — the trixie shell links it; alternatively copy `libdisplay-info.so.2` out of the emb sysroot into the bundle's `lib/` |
+| `libdisplay-info` | `sudo apt install libdisplay-info2` — the trixie shell links it; alternatively copy `libdisplay-info.so.0.2.0` out of the emb sysroot into the bundle's `lib/` and recreate the soname link beside it (`ln -sf libdisplay-info.so.0.2.0 lib/libdisplay-info.so.2`), which the prune above eats along with the library. The Pi 5 image already carries it |
 | a camera | `BEV_MODE=camera` needs one attached; check with `rpicam-hello --list-cameras` |
 
 ### Tearing, and what the fence counters say
@@ -260,6 +279,28 @@ A build with `enable_vulkan: false` (or no Vulkan headers) still runs on a Vulka
 backend, allocating from the render node; the compositor then has to import a
 buffer its device did not allocate.
 
+### What the Vulkan backends need from the shell
+
+`drm-kms-vulkan` blends platform views into its backing store rather than
+putting them on a plane, and until v3.0 `4bb31fda` it never handed the producer
+a release fence for that read — every submit came back with `-1`, so the ring
+depth was the only thing keeping the compositor and the producer apart. On an
+older shell the counters look *clean* (`fence waits 0`) precisely because
+nothing is being waited on; read that as "no signal", not "no contention".
+
+A run on the Pi 5's DSI panel also needs `IVI_DRMVK_VSYNC=0`:
+
+```bash
+ssh <user>@<host> 'cd bev-view && IVI_DRMVK_VSYNC=0 BACKEND=drm-kms-vulkan ./run-bev.sh'
+```
+
+That panel's driver (`rp1-dsi`) delivers no page-flip completion events, and the
+backend's flip-driven vsync waits on one forever: the compositor presents two
+frames and goes silent while the producer keeps submitting at full rate, so the
+screen freezes on a stale frame with healthy-looking producer stats. The
+wall-clock vsync source sidesteps it. HDMI on vc4 is unaffected, as is
+`drm-kms-egl` on the same panel.
+
 ## What you should see
 
 - **pattern** — scrolling colour bars with a dark band sweeping down. Bars move
@@ -273,6 +314,23 @@ buffer its device did not allocate.
 The top-left overlay reads the view's counters every 500 ms: fps, source and
 view size, the grant, and the buffer allocator. **snapshot** writes
 `/tmp/bev_snapshot_NNN.png` on the machine running the shell.
+
+The first submit also prints, once, which halves of explicit sync are actually
+in play:
+
+```text
+[bev/ihs_pv] first submit: acquire fence yes, release fence no
+```
+
+`fence waits 0` in the stats reads the same whether the producer never made an
+acquire fence or the compositor never handed a release one back; this line says
+which. `release fence no` on the very first submit is normal — no composite has
+run yet — but a run that never accumulates fence waits afterwards is the
+compositor staying silent.
+
+Producer counters alone cannot tell you the picture reached the display: they
+count submits, not presents. If the stats look healthy while the screen is
+frozen, check the shell's own present log before suspecting the view.
 
 If the pipeline cannot start (no camera, a missing file, a config slot without
 `hb2i`), the view shows black and the reason is in the native log under
@@ -289,6 +347,7 @@ arguments, so the source is chosen from the environment:
 |---|---|
 | `BEV_MODE` | `pattern` (default), `camera`, `file`, `surround` |
 | `BEV_CAMERA`, `BEV_TUNING_FILE` | camera index; IPA tuning JSON (`--tuning-file`) |
+| `BEV_CAM_FPS` | pin the sensor's frame duration; unset leaves the rate to auto-exposure, which trades it for light |
 | `BEV_FILE`, `BEV_FILE_BEV=1` | HEVC recording; forward bird's-eye view (`--bev`) |
 | `BEV_SRC` | recordings in config-slot order, `:`-separated (`--src`) |
 | `BEV_FORWARD_LEFT` … `BEV_BACKWARD_RIGHT` | the fixed-slot pair rig (`--forward-left` …) |
