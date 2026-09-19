@@ -66,3 +66,6 @@ mat3 ground_to_image_H(double cam_x, double cam_y, double h,
 // sign/axis mistake shows up immediately as "OUTSIDE image" instead of a
 // silent black/garbage render.
 void ipm_debug_check(const mat3 &H, int bev_w, int bev_h, const char *label);
+mat3 measured_H(const mat3 &Hb2i, int img_w, int img_h,
+                double px_per_m, int bev_w, int bev_h,
+                double dx = 0.0, double dy = 0.0, double dyaw_deg = 0.0);

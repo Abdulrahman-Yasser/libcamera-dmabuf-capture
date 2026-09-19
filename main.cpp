@@ -51,33 +51,6 @@ using namespace libcamera;
 // size), which can be a different resolution entirely. Hb2i's raw output is
 // in calibration-image pixels, so normalizing by anything other than the
 // resolution it was measured at would silently rescale the homography.
-static constexpr double CAL_W = 3280.0, CAL_H = 2464.0;
-
-static mat3 measured_H(const mat3 &Hb2i, int img_w, int img_h,
-                       double px_per_m, int bev_w, int bev_h,
-                       double dx = 0.0, double dy = 0.0, double dyaw_deg = 0.0) {
-    (void)img_w; (void)img_h; // kept for call-site compatibility; see CAL_W/CAL_H above
-    const double r = px_per_m;
-    const double Xc = 0.27, Yc = 0.36;
-    mat3 S;
-    S.at(0,0)= 1.0/r; S.at(0,1)= 0.0;   S.at(0,2)= -(bev_w/2.0)/r + Xc;
-    S.at(1,0)= 0.0;   S.at(1,1)=-1.0/r; S.at(1,2)=  (bev_h/2.0)/r + Yc;
-    S.at(2,0)= 0.0;   S.at(2,1)= 0.0;   S.at(2,2)= 1.0;
-
-    // Rigid transform in board-metre space: rotate by dyaw about the board
-    // origin, then translate by (dx,dy). Identity when untouched, so an
-    // un-tuned slot renders exactly as before this fix.
-    const double rad = dyaw_deg * M_PI / 180.0;
-    const double ca = std::cos(rad), sa = std::sin(rad);
-    mat3 T;
-    T.at(0,0)= ca; T.at(0,1)=-sa; T.at(0,2)= dx;
-    T.at(1,0)= sa; T.at(1,1)= ca; T.at(1,2)= dy;
-    T.at(2,0)= 0;  T.at(2,1)=  0; T.at(2,2)= 1;
-
-    mat3 H = Hb2i * T * S;
-    for (int col = 0; col < 3; ++col) { H.at(0,col) /= CAL_W; H.at(1,col) /= CAL_H; }
-    return H;
-}
 
 // Naming-convention lookup for a per-lens-model distortion file:
 // "<lens_dir>/<lens_model>-lens.ini". lens_model is used verbatim -- no
@@ -1269,7 +1242,8 @@ int main(int argc, char *argv[])
     // Theoretical memory bandwidth per frame:
     //   Read:  NV12 = W*H*1.5 bytes (Y plane + UV half-res)
     //   Write: RGBA = W*H*4   bytes (FBO color attachment)
-    int W = state.config->at(0).size.width, H = state.config->at(0).size.height;
+    auto &sc0 = state.slots[0].config->at(0);
+    int W = sc0.size.width, H = sc0.size.height;
     double nv12_mb   = (double)W * H * 1.5 / 1048576.0;
     double rgba_mb   = (double)W * H * 4.0 / 1048576.0;
     double bw_mbps   = (nv12_mb + rgba_mb) * actual_fps;

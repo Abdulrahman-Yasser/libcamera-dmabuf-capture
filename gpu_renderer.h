@@ -103,6 +103,8 @@ public:
 
     bool init_multi(const EGLState &egl, int w, int h, int stride, int num_cameras);
     void render_frame_multi(const std::vector<DmaBufFrame> &frames);
+    bool init_multi_live(const EGLState &egl, int w, int h, int stride, int num_cameras);
+    void render_frame_multi_live(const std::vector<const libcamera::FrameBuffer *> &bufs);
     // Uploads one slot's homography + facing bearing (degrees, see
     // BEV_ALGORITHM.md's yaw->facing formula) — cheap, called per keypress
     // for just the changed slot, not all N.
@@ -182,6 +184,8 @@ public:
 
     bool save_snapshot(const char *path);
 
+    bool export_fbo_dmabuf(int &fd, int &stride, int &fourcc, uint64_t &modifier);
+
     // Sampleable color attachment of the render FBO (GL_TEXTURE_2D) — used to
     // composite the rendered frame onto a window surface in preview mode.
     GLuint fbo_texture() const { return fbo_tex_; }
@@ -209,6 +213,12 @@ private:
     // before their glFlush(). No-op if init_car_icon() was never
     // called/failed (prog_car_ == 0).
     void        draw_car_icon();
+
+    EGLImageKHR exp_image_  = EGL_NO_IMAGE_KHR;
+    int         exp_fd_     = -1;
+    int         exp_stride_ = 0;
+    int         exp_fourcc_ = 0;
+    uint64_t    exp_mod_    = 0;
 
     const EGLState *egl_    = nullptr;
     int             W_      = 0;
