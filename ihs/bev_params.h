@@ -49,6 +49,14 @@ struct BevParams {
     int         width = 0, height = 0; // 0 = the mode's default
     std::string tuning_file;
 
+    // Camera mode's frame rate, as a frame-duration limit handed to libcamera.
+    // 0 leaves the duration to the IPA, which is what you want for a still
+    // image and not for a surround view: in a dim room auto-exposure buys light
+    // by lengthening the frame, so the same scene streams at 30 fps by a window
+    // and 20 fps under office light, and two runs stop being comparable. Pin it
+    // and AE trades gain instead -- a noisier frame at a rate you chose.
+    double camera_fps = 0.0;
+
     // Pattern mode's frame rate. The other modes pace to their source (the
     // sensor, or the recording's rate); the pattern has none, so it paces
     // itself. 0 = uncapped.

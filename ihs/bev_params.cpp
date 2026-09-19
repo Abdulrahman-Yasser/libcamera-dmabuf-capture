@@ -115,6 +115,9 @@ bool bev_params_parse(const uint8_t *data, size_t size, const std::string &asset
         } else if (key == "pattern_fps") {
             if (!to_double(val, out.pattern_fps) || out.pattern_fps < 0.0)
                 return bad("a frame rate (0 = uncapped)");
+        } else if (key == "camera_fps") {
+            if (!to_double(val, out.camera_fps) || out.camera_fps < 0.0)
+                return bad("a frame rate (0 = leave it to auto-exposure)");
         } else if (key == "tuning_file") {
             out.tuning_file = resolve_path(val, assets_dir);
         } else if (key == "file") {

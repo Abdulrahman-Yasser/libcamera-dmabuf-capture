@@ -33,6 +33,7 @@ final class BevCameraSource extends BevSource {
     this.index = 0,
     this.width,
     this.height,
+    this.fps,
     this.tuningFile,
   });
 
@@ -41,6 +42,13 @@ final class BevCameraSource extends BevSource {
   /// Requested stream size; libcamera may adjust it. Default 1640x1232.
   final int? width;
   final int? height;
+
+  /// Pins the sensor's frame duration, capping the exposure auto-exposure may
+  /// choose. Null leaves the duration to the IPA, which lengthens the frame to
+  /// gather light — so the same scene streams slower in a dim room than a lit
+  /// one, and two runs are no longer comparable. Set it when the rate matters
+  /// more than the noise, as it does for a surround view.
+  final double? fps;
 
   /// IPA tuning JSON, as `--tuning-file`. Process-wide: only the first camera
   /// view's value takes effect.
@@ -52,6 +60,7 @@ final class BevCameraSource extends BevSource {
     MapEntry('camera_index', '$index'),
     if (width != null) MapEntry('width', '$width'),
     if (height != null) MapEntry('height', '$height'),
+    if (fps != null) MapEntry('camera_fps', '$fps'),
     if (tuningFile != null) MapEntry('tuning_file', tuningFile!),
   ];
 }

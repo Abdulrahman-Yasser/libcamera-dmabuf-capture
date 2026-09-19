@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 ///
 ///   BEV_MODE        pattern (default) | camera | file | surround
 ///   BEV_CAMERA      camera index                               (camera)
+///   BEV_CAM_FPS     pin the sensor's frame rate                (camera)
 ///   BEV_TUNING_FILE IPA tuning JSON                            (camera)
 ///   BEV_FILE        HEVC recording                             (file)
 ///   BEV_FILE_BEV    1 = forward bird's-eye view                (file)
@@ -31,6 +32,7 @@ BevSource sourceFromEnvironment(Map<String, String> env) {
     case 'camera':
       return BevCameraSource(
         index: int.tryParse(get('BEV_CAMERA') ?? '') ?? 0,
+        fps: double.tryParse(get('BEV_CAM_FPS') ?? ''),
         tuningFile: get('BEV_TUNING_FILE'),
       );
     case 'file':

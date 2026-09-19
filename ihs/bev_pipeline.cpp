@@ -207,7 +207,19 @@ bool BevPipeline::init_camera()
         session_ = std::make_unique<CaptureSession>(sc, camera_.get());
     }
     camera_->requestCompleted.connect(session_.get(), &CaptureSession::requestCompleted);
-    if (camera_->start()) return false;
+
+    // A frame-duration limit, when one was asked for. Both ends of the range are
+    // the same value: libcamera reads it as "every frame lasts this long", which
+    // caps the exposure AE may choose and so pins the rate. Left empty, the IPA
+    // is free to stretch the frame for light, and the rate follows the room.
+    ControlList controls(camera_->controls());
+    if (params_.camera_fps > 0.0) {
+        const int64_t us = (int64_t)(1'000'000.0 / params_.camera_fps + 0.5);
+        controls.set(controls::FrameDurationLimits, Span<const int64_t, 2>({us, us}));
+        std::printf("[bev/camera] frame duration pinned to %ld us (%.3g fps)\n",
+                    (long)us, params_.camera_fps);
+    }
+    if (camera_->start(&controls)) return false;
     camera_started_ = true;
     for (auto &req : requests_) camera_->queueRequest(req.get());
 
