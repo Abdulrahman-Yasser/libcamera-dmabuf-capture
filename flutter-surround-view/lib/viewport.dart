@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import 'models.dart';
+import 'pipeline_view.dart';
 
 class CameraViewport extends StatelessWidget {
   const CameraViewport({
@@ -9,17 +10,21 @@ class CameraViewport extends StatelessWidget {
     required this.overlays,
     required this.camSubViews,
     this.frontRearCamera = CameraId.front,
+    this.livePipeline = false,
   });
 
   final ViewMode mode;
   final Set<CameraOverlay> overlays;
   final CameraId frontRearCamera;
+  final bool livePipeline;
   final Map<CameraId, CameraSubView> camSubViews;
 
   @override
   Widget build(BuildContext context) {
     final Widget content = switch (mode) {
-      ViewMode.surround360 => const Surround360Placeholder(),
+      ViewMode.surround360 => livePipeline
+          ? const PipelineView()
+          : const Surround360Placeholder(),
       ViewMode.sideViews => _SideViews(subViews: camSubViews),
       ViewMode.frontRear =>
         CameraBox(camera: frontRearCamera, showLabel: true),

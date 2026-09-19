@@ -186,6 +186,11 @@ public:
 
     bool export_fbo_dmabuf(int &fd, int &stride, int &fourcc, uint64_t &modifier);
 
+    bool init_export_ring(int count);
+    bool has_export_ring() const { return !ring_.empty(); }
+    int  next_ring_slot() const { return ring_next_; }
+    bool export_ring_frame(int &buffer_id, int &fd, int &stride, int &fourcc);
+
     // Sampleable color attachment of the render FBO (GL_TEXTURE_2D) — used to
     // composite the rendered frame onto a window surface in preview mode.
     GLuint fbo_texture() const { return fbo_tex_; }
@@ -213,6 +218,17 @@ private:
     // before their glFlush(). No-op if init_car_icon() was never
     // called/failed (prog_car_ == 0).
     void        draw_car_icon();
+
+    struct ExportBuf {
+        gbm_bo     *bo     = nullptr;
+        int         fd     = -1;
+        int         stride = 0;
+        EGLImageKHR image  = EGL_NO_IMAGE_KHR;
+        GLuint      tex    = 0;
+    };
+    std::vector<ExportBuf> ring_;
+    GLuint                 fbo_export_ = 0;
+    int                    ring_next_  = 0;
 
     EGLImageKHR exp_image_  = EGL_NO_IMAGE_KHR;
     int         exp_fd_     = -1;

@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import 'controls.dart';
 import 'models.dart';
+import 'pipeline_ffi.dart';
+import 'pipeline_view.dart';
 import 'settings_page.dart';
 import 'viewport.dart';
 
@@ -58,6 +60,31 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
     for (final CameraId c in CameraId.values) c: CalDelta(),
   };
 
+  Pipeline? _pipeline;
+
+  @override
+  void initState() {
+    super.initState();
+    _pipeline = Pipeline.open();
+    _pipeline?.registerPlatformView(kPipelineViewType);
+    _pipeline?.start().then((bool ok) {
+      if (!mounted) return;
+      setState(() {});
+      _toast(ok ? 'Pipeline running' : 'Pipeline failed to start');
+    });
+  }
+
+  @override
+  void dispose() {
+    _pipeline?.dispose();
+    super.dispose();
+  }
+
+  void _sendCalibration(CameraId camera) {
+    final CalDelta d = _deltas[camera]!;
+    _pipeline?.setCalibration(camera.index, d.x / 100.0, d.y / 100.0, d.yaw);
+  }
+
   void _toast(String message) {
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
@@ -112,6 +139,7 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
           case CalAxis.yaw:
             d.yaw += sign * 0.5;
         }
+        _sendCalibration(_calibCamera);
       });
 
   void _openSettings() {
@@ -121,10 +149,12 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
           initialDeltas: _deltas,
           onSave: (CameraId camera, CalDelta delta) => setState(() {
             _deltas[camera] = delta;
+            _sendCalibration(camera);
             _toast('Calibration saved for ${camera.label} (mock)');
           }),
           onReset: (CameraId camera) => setState(() {
             _deltas[camera] = CalDelta();
+            _sendCalibration(camera);
           }),
         ),
       ),
@@ -158,6 +188,7 @@ class _SurroundViewScreenState extends State<SurroundViewScreen> {
             overlays: _overlays,
             camSubViews: _camSubView,
             frontRearCamera: _frontRearCamera,
+            livePipeline: _pipeline?.running ?? false,
           ),
         ),
         Positioned(

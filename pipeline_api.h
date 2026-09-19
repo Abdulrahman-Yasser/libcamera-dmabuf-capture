@@ -24,6 +24,8 @@ int  pipeline_get_frame(PipelineHandle *h, PipelineFrame *out);
 int  pipeline_set_calibration(PipelineHandle *h, int slot,
                               double cam_x_delta, double cam_y_delta, double yaw_delta_deg);
 
+int  pipeline_register_platform_view(PipelineHandle *h, const char *view_type);
+
 int  pipeline_save_snapshot(PipelineHandle *h, const char *path);
 
 void pipeline_stop(PipelineHandle *h);

@@ -159,9 +159,18 @@ target_link_libraries(pipeline_core PRIVATE
     PkgConfig::GST_VIDEO
 )
 target_include_directories(pipeline_core PRIVATE extern/stb)
+set(IHS_SHARED_PREFIX "" CACHE PATH "Install prefix of libihs_shared; enables the ivi-homescreen platform view adapter")
+if (IHS_SHARED_PREFIX)
+    target_include_directories(pipeline_core PRIVATE ${IHS_SHARED_PREFIX}/include)
+    target_link_libraries(pipeline_core PRIVATE ${IHS_SHARED_PREFIX}/lib/libihs_shared.so)
+    target_compile_definitions(pipeline_core PRIVATE PIPELINE_HAVE_IHS)
+endif ()
 install(TARGETS pipeline_core LIBRARY DESTINATION lib)
 install(FILES pipeline_api.h DESTINATION include)
 
 add_executable(pipeline_api_test pipeline_api_test.cpp)
 target_link_libraries(pipeline_api_test PRIVATE pipeline_core)
+if (IHS_SHARED_PREFIX)
+    target_link_options(pipeline_api_test PRIVATE -Wl,-rpath-link,${IHS_SHARED_PREFIX}/lib)
+endif ()
 

@@ -2008,6 +2008,74 @@ bool GpuRenderer::save_snapshot(const char *path)
     return true;
 }
 
+bool GpuRenderer::init_export_ring(int count)
+{
+    if (!egl_ || !egl_->gbm_dev) {
+        std::cerr << "[gpu] export ring needs a GBM device\n";
+        return false;
+    }
+    glGenFramebuffers(1, &fbo_export_);
+    ring_.resize(count);
+    for (auto &b : ring_) {
+        b.bo = gbm_bo_create(egl_->gbm_dev, W_, H_, GBM_FORMAT_ABGR8888,
+                             GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR);
+        if (!b.bo) {
+            std::cerr << "[gpu] gbm_bo_create(linear) failed\n";
+            return false;
+        }
+        b.fd     = gbm_bo_get_fd(b.bo);
+        b.stride = (int)gbm_bo_get_stride(b.bo);
+
+        const EGLint attrs[] = {
+            EGL_WIDTH,                     W_,
+            EGL_HEIGHT,                    H_,
+            EGL_LINUX_DRM_FOURCC_EXT,      DRM_FORMAT_ABGR8888,
+            EGL_DMA_BUF_PLANE0_FD_EXT,     b.fd,
+            EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+            EGL_DMA_BUF_PLANE0_PITCH_EXT,  b.stride,
+            EGL_NONE,
+        };
+        b.image = pfn_CreateImage(egl_->dpy, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
+        if (b.image == EGL_NO_IMAGE_KHR) {
+            std::cerr << "[gpu] eglCreateImageKHR(export ring) failed (0x"
+                      << std::hex << eglGetError() << std::dec << ")\n";
+            return false;
+        }
+        glGenTextures(1, &b.tex);
+        glBindTexture(GL_TEXTURE_2D, b.tex);
+        pfn_TexImage2DOES(GL_TEXTURE_2D, b.image);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_export_);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ring_[0].tex, 0);
+    bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    if (!ok) std::cerr << "[gpu] export ring FBO incomplete\n";
+    std::printf("[gpu] export ring: %d linear buffers, stride=%d\n", count, ring_[0].stride);
+    return ok;
+}
+
+bool GpuRenderer::export_ring_frame(int &buffer_id, int &fd, int &stride, int &fourcc)
+{
+    if (ring_.empty()) return false;
+    int i = ring_next_;
+    ring_next_ = (ring_next_ + 1) % (int)ring_.size();
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo_export_);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ring_[i].tex, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
+    glBlitFramebuffer(0, 0, W_, H_, 0, 0, W_, H_, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glFinish();
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+
+    fd = dup(ring_[i].fd);
+    if (fd < 0) return false;
+    buffer_id = i;
+    stride    = ring_[i].stride;
+    fourcc    = DRM_FORMAT_ABGR8888;
+    return true;
+}
+
 bool GpuRenderer::export_fbo_dmabuf(int &fd, int &stride, int &fourcc, uint64_t &modifier)
 {
     if (exp_fd_ < 0) {
@@ -2064,6 +2132,15 @@ void GpuRenderer::cleanup()
             pfn_DestroyImage(egl_->dpy, res.image);
     }
     fd_cache_.clear();
+
+    for (auto &b : ring_) {
+        if (b.tex) glDeleteTextures(1, &b.tex);
+        if (b.image != EGL_NO_IMAGE_KHR) pfn_DestroyImage(egl_->dpy, b.image);
+        if (b.fd >= 0) close(b.fd);
+        if (b.bo) gbm_bo_destroy(b.bo);
+    }
+    ring_.clear();
+    if (fbo_export_) { glDeleteFramebuffers(1, &fbo_export_); fbo_export_ = 0; }
 
     if (exp_fd_ >= 0) { close(exp_fd_); exp_fd_ = -1; }
     if (exp_image_ != EGL_NO_IMAGE_KHR) {
