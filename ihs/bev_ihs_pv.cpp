@@ -585,8 +585,12 @@ private:
         int release_fence_fd = -1;
         const int rc = ihs_pv_submit(view_, &frame, acquire_fence_fd, &release_fence_fd);
         if (rc != IHS_PV_OK) {
-            // Ownership only transfers on success.
-            if (frame.plane_fd[0] >= 0) close(frame.plane_fd[0]);
+            // Nothing to close here: submit consumes the frame's fds whatever it
+            // returns (ivi-homescreen #606). This used to close the dup on a
+            // failed submit, on the assumption that ownership transferred only
+            // on success -- which double-closed every refused import, silently,
+            // landing several submits later on an unrelated fd that reused the
+            // number.
             static std::once_flag warned;
             std::call_once(warned, [&] {
                 std::fprintf(stderr, "[bev/ihs_pv] view %d: submit failed: %d\n", id_, rc);
