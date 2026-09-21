@@ -17,6 +17,8 @@ import 'package:flutter/material.dart';
 ///   BEV_FILE        HEVC recording                             (file)
 ///   BEV_FILE_BEV    1 = forward bird's-eye view                (file)
 ///   BEV_SRC         recordings, ':'-separated, in slot order   (surround)
+///   BEV_CAMERAS     number of live cameras, slots 0..N-1       (surround)
+///   BEV_WIDTH / BEV_HEIGHT   live camera stream size            (surround)
 ///   BEV_FORWARD_LEFT / _RIGHT, BEV_BACKWARD_LEFT / _RIGHT      (surround)
 ///   BEV_CONFIG      bev_config.ini path                        (surround)
 ///   BEV_LENS_DIR, BEV_BLEND, BEV_PX_PER_M, BEV_CAR_ICON        (surround)
@@ -52,6 +54,20 @@ BevSource sourceFromEnvironment(Map<String, String> env) {
         pxPerMeter: double.tryParse(get('BEV_PX_PER_M') ?? ''),
         carIcon: carIcon == null ? null : BevCarIcon(carIcon),
       );
+      final cameras = int.tryParse(get('BEV_CAMERAS') ?? '');
+      if (cameras != null) {
+        return BevSurroundSource(
+          [for (var i = 0; i < cameras; i++) 'camera:$i'],
+          config: common.config,
+          lensDir: common.lensDir,
+          blend: blend,
+          pxPerMeter: common.pxPerMeter,
+          carIcon: common.carIcon,
+          fps: double.tryParse(get('BEV_CAM_FPS') ?? ''),
+          width: int.tryParse(get('BEV_WIDTH') ?? ''),
+          height: int.tryParse(get('BEV_HEIGHT') ?? ''),
+        );
+      }
       final src = get('BEV_SRC');
       if (src != null) {
         return BevSurroundSource(

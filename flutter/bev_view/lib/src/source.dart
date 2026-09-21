@@ -130,6 +130,9 @@ final class BevSurroundSource extends BevSource {
     this.blend = BevBlend.feather,
     this.pxPerMeter,
     this.carIcon,
+    this.fps,
+    this.width,
+    this.height,
   }) : forwardLeft = null,
        forwardRight = null,
        backwardLeft = null,
@@ -147,6 +150,9 @@ final class BevSurroundSource extends BevSource {
     this.blend = BevBlend.feather,
     this.pxPerMeter,
     this.carIcon,
+    this.fps,
+    this.width,
+    this.height,
   }) : sources = null;
 
   final List<String>? sources;
@@ -165,9 +171,18 @@ final class BevSurroundSource extends BevSource {
   final double? pxPerMeter;
   final BevCarIcon? carIcon;
 
+  /// Live cameras only: pins the sensors' frame rate, and the requested
+  /// stream size (the same for every camera).
+  final double? fps;
+  final int? width;
+  final int? height;
+
   @override
   List<MapEntry<String, String>> toParams() => [
     const MapEntry('mode', 'surround'),
+    if (fps != null) MapEntry('camera_fps', '$fps'),
+    if (width != null) MapEntry('width', '$width'),
+    if (height != null) MapEntry('height', '$height'),
     for (final src in sources ?? const <String>[]) MapEntry('src', src),
     if (forwardLeft != null) MapEntry('forward_left', forwardLeft!),
     if (forwardRight != null) MapEntry('forward_right', forwardRight!),

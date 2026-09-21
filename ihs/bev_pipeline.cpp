@@ -79,6 +79,7 @@ void BevPipeline::interrupt()
 {
     std::lock_guard<std::mutex> lock(session_mutex_);
     if (session_) session_->stop();
+    for (CaptureSession *s : live_sessions_) s->stop();
 }
 
 void BevPipeline::shutdown()
@@ -90,6 +91,7 @@ void BevPipeline::shutdown()
         camera_started_ = false;
     }
     if (camera_ && session_) camera_->requestCompleted.disconnect(session_.get());
+    stop_live_cameras();
     renderer_.reset();
     requests_.clear();
     if (buffer_allocator_ && stream_) buffer_allocator_->free(stream_);
@@ -105,6 +107,7 @@ void BevPipeline::shutdown()
     }
     camera_.reset();
     camera_config_.reset();
+    release_live_slots();
     camera_manager_.reset();
 
     file_src_.reset();
@@ -300,11 +303,35 @@ bool BevPipeline::init_surround()
         }
     }
 
+    bool any_live = false, all_live = true;
+    for (const std::string &s : params_.sources) {
+        const bool is_live = s.rfind("camera:", 0) == 0;
+        any_live = any_live || is_live;
+        all_live = all_live && is_live;
+    }
+    if (any_live && !all_live) {
+        std::fprintf(stderr, "[bev/surround] camera sources cannot be mixed with files\n");
+        return false;
+    }
+    if (any_live && pyramid_) {
+        std::fprintf(stderr, "[bev/surround] blend=pyramid has no live camera path\n");
+        return false;
+    }
+    live_ = any_live;
+    if (live_) {
+        camera_manager_ = acquire_camera_manager(params_.tuning_file);
+        if (!camera_manager_) return false;
+    }
+
     slots_.resize((size_t)n);
     for (int i = 0; i < n; ++i) {
         Slot &slot    = slots_[(size_t)i];
         slot.path     = params_.sources[(size_t)i];
         slot.cfg_slot = params_.cfg_slots[(size_t)i];
+        if (live_) {
+            if (!open_live_slot(slot, std::atoi(slot.path.c_str() + 7))) return false;
+            continue;
+        }
         slot.src      = std::make_unique<FileSource>();
         if (!slot.src->open(slot.path)) return false;
         slot.frame = slot.src->nextFrame();
@@ -312,14 +339,25 @@ bool BevPipeline::init_surround()
             std::fprintf(stderr, "[bev/surround] no first frame from %s\n", slot.path.c_str());
             return false;
         }
+        slot.width  = slot.frame.width;
+        slot.height = slot.frame.height;
+        slot.stride = slot.frame.stride;
     }
-    frames_.resize((size_t)n);
+    if (!live_) frames_.resize((size_t)n);
 
-    // Canvas is slot 0's first-frame size, fixed for the run.
-    const int canvas_w = slots_[0].frame.width, canvas_h = slots_[0].frame.height;
-    const bool ok = pyramid_
-        ? renderer_->init_multi_pyramid(*egl_, canvas_w, canvas_h, slots_[0].frame.stride, n)
-        : renderer_->init_multi(*egl_, canvas_w, canvas_h, slots_[0].frame.stride, n);
+    const int canvas_w = slots_[0].width, canvas_h = slots_[0].height;
+    if (live_) {
+        for (const Slot &slot : slots_) {
+            if (slot.width != canvas_w || slot.height != canvas_h) {
+                std::fprintf(stderr, "[bev/surround] all cameras must use the same size\n");
+                return false;
+            }
+        }
+    }
+    bool ok;
+    if (live_)        ok = renderer_->init_multi_live(*egl_, canvas_w, canvas_h, slots_[0].stride, n);
+    else if (pyramid_) ok = renderer_->init_multi_pyramid(*egl_, canvas_w, canvas_h, slots_[0].stride, n);
+    else              ok = renderer_->init_multi(*egl_, canvas_w, canvas_h, slots_[0].stride, n);
     if (!ok) return false;
 
     if (!params_.car_icon.empty()) {
@@ -342,7 +380,6 @@ bool BevPipeline::init_surround()
     for (int i = 0; i < n; ++i) {
         const Slot &slot = slots_[(size_t)i];
         BevSlotConfig &sc = cfg.slots[slot.cfg_slot];
-        const DmaBufFrame &f = slot.frame;
 
         // Lens distortion, normalized to this slot's frame size.
         if (!sc.lens_model.empty() &&
@@ -351,12 +388,12 @@ bool BevPipeline::init_surround()
                         "without distortion correction\n", sc.lens_model.c_str(), slot.cfg_slot + 1);
         float fxn = 0, fyn = 0, cxn = 0, cyn = 0;
         if (sc.has_distortion) {
-            const float sx = (float)f.width / (float)sc.lens_calib_w;
-            const float sy = (float)f.height / (float)sc.lens_calib_h;
-            fxn = (float)sc.fx * sx / (float)f.width;
-            fyn = (float)sc.fy * sy / (float)f.height;
-            cxn = (float)sc.cx * sx / (float)f.width;
-            cyn = (float)sc.cy * sy / (float)f.height;
+            const float sx = (float)slot.width / (float)sc.lens_calib_w;
+            const float sy = (float)slot.height / (float)sc.lens_calib_h;
+            fxn = (float)sc.fx * sx / (float)slot.width;
+            fyn = (float)sc.fy * sy / (float)slot.height;
+            cxn = (float)sc.cx * sx / (float)slot.width;
+            cyn = (float)sc.cy * sy / (float)slot.height;
         }
         if (pyramid_)
             renderer_->set_distortion_multi_pyramid(i, sc.has_distortion, fxn, fyn, cxn, cyn,
@@ -367,7 +404,7 @@ bool BevPipeline::init_surround()
 
         // The saved deltas are exactly the live pose's offset from the
         // calibration pose that main.cpp's rebuild_slot() computes.
-        mat3 H = measured_H(sc.hb2i, f.width, f.height, px_per_m, canvas_w, canvas_h,
+        mat3 H = measured_H(sc.hb2i, slot.width, slot.height, px_per_m, canvas_w, canvas_h,
                             sc.cam_x_delta, sc.cam_y_delta, sc.yaw_delta);
         float Hf[9];
         H.to_floats(Hf);
@@ -383,11 +420,13 @@ bool BevPipeline::init_surround()
     renderer_->set_px_per_m((float)px_per_m);
     std::printf("[bev/surround] %d source(s), blend=%s, canvas %dx%d\n",
                 n, params_.blend.c_str(), canvas_w, canvas_h);
+    if (live_ && !start_live_cameras()) return false;
     return true;
 }
 
 bool BevPipeline::render_surround()
 {
+    if (live_) return render_surround_live();
     for (size_t i = 0; i < slots_.size(); ++i) frames_[i] = slots_[i].frame;
     if (pyramid_) renderer_->render_frame_multi_pyramid(frames_);
     else          renderer_->render_frame_multi(frames_);
@@ -395,6 +434,132 @@ bool BevPipeline::render_surround()
     for (auto &slot : slots_)
         if (!advance(*slot.src, slot.path, slot.frame)) return false;
     return true;
+}
+
+bool BevPipeline::open_live_slot(Slot &slot, int index)
+{
+    const auto cameras = camera_manager_->cameras();
+    if (index < 0 || (size_t)index >= cameras.size()) {
+        std::fprintf(stderr, "[bev/surround] camera %d requested, but %zu camera(s) detected\n",
+                     index, cameras.size());
+        return false;
+    }
+    slot.camera = cameras[(size_t)index];
+    std::printf("[bev/surround] camera %d: %s\n", index, slot.camera->id().c_str());
+    if (slot.camera->acquire()) {
+        std::fprintf(stderr, "[bev/surround] %s is in use\n", slot.camera->id().c_str());
+        return false;
+    }
+    slot.acquired = true;
+
+    slot.config = slot.camera->generateConfiguration({StreamRole::Viewfinder});
+    if (!slot.config) return false;
+    StreamConfiguration &sc = slot.config->at(0);
+    sc.size        = {(unsigned)(params_.width  > 0 ? params_.width  : 1640),
+                      (unsigned)(params_.height > 0 ? params_.height : 1232)};
+    sc.pixelFormat = formats::NV12;
+
+    const auto status = slot.config->validate();
+    if (status == CameraConfiguration::Invalid) {
+        std::fprintf(stderr, "[bev/surround] camera %d: no supported format\n", index);
+        return false;
+    }
+    if (status == CameraConfiguration::Adjusted)
+        std::printf("[bev/surround] camera %d: config adjusted: %s\n", index, sc.toString().c_str());
+    if (slot.camera->configure(slot.config.get())) {
+        std::fprintf(stderr, "[bev/surround] camera %d: configure failed\n", index);
+        return false;
+    }
+
+    slot.stream    = sc.stream();
+    slot.allocator = std::make_unique<FrameBufferAllocator>(slot.camera);
+    if (slot.allocator->allocate(slot.stream) < 0) return false;
+    for (auto &buf : slot.allocator->buffers(slot.stream)) {
+        auto req = slot.camera->createRequest();
+        if (!req || req->addBuffer(slot.stream, buf.get())) return false;
+        slot.requests.push_back(std::move(req));
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        slot.session = std::make_unique<CaptureSession>(sc, slot.camera.get());
+        live_sessions_.push_back(slot.session.get());
+    }
+    slot.camera->requestCompleted.connect(slot.session.get(), &CaptureSession::requestCompleted);
+
+    slot.width  = (int)sc.size.width;
+    slot.height = (int)sc.size.height;
+    slot.stride = (int)sc.stride;
+    return true;
+}
+
+bool BevPipeline::start_live_cameras()
+{
+    for (Slot &slot : slots_) {
+        ControlList controls(slot.camera->controls());
+        if (params_.camera_fps > 0.0) {
+            const int64_t us = (int64_t)(1'000'000.0 / params_.camera_fps + 0.5);
+            controls.set(controls::FrameDurationLimits, Span<const int64_t, 2>({us, us}));
+        }
+        if (slot.camera->start(&controls)) {
+            std::fprintf(stderr, "[bev/surround] camera start failed\n");
+            return false;
+        }
+        slot.started = true;
+        for (auto &req : slot.requests) slot.camera->queueRequest(req.get());
+    }
+    return true;
+}
+
+bool BevPipeline::render_surround_live()
+{
+    live_bufs_.clear();
+    live_reqs_.clear();
+    for (Slot &slot : slots_) {
+        auto [buf, req] = slot.session->nextFrame();
+        if (!buf) return false;
+        live_bufs_.push_back(buf);
+        live_reqs_.push_back(req);
+    }
+    renderer_->render_frame_multi_live(live_bufs_);
+    for (size_t i = 0; i < slots_.size(); ++i) {
+        live_reqs_[i]->reuse(Request::ReuseBuffers);
+        slots_[i].camera->queueRequest(live_reqs_[i]);
+    }
+    return true;
+}
+
+void BevPipeline::stop_live_cameras()
+{
+    for (Slot &slot : slots_) {
+        if (slot.started) {
+            slot.camera->stop();
+            slot.started = false;
+        }
+        if (slot.camera && slot.session)
+            slot.camera->requestCompleted.disconnect(slot.session.get());
+    }
+}
+
+void BevPipeline::release_live_slots()
+{
+    {
+        std::lock_guard<std::mutex> lock(session_mutex_);
+        live_sessions_.clear();
+    }
+    for (Slot &slot : slots_) {
+        slot.requests.clear();
+        if (slot.allocator && slot.stream) slot.allocator->free(slot.stream);
+        slot.allocator.reset();
+        slot.stream = nullptr;
+        slot.session.reset();
+        if (slot.acquired) {
+            slot.camera->release();
+            slot.acquired = false;
+        }
+        slot.camera.reset();
+        slot.config.reset();
+    }
 }
 
 // ── Test pattern ─────────────────────────────────────────────────────────────

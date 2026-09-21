@@ -103,6 +103,8 @@ public:
 
     bool init_multi(const EGLState &egl, int w, int h, int stride, int num_cameras);
     void render_frame_multi(const std::vector<DmaBufFrame> &frames);
+    bool init_multi_live(const EGLState &egl, int w, int h, int stride, int num_cameras);
+    void render_frame_multi_live(const std::vector<const libcamera::FrameBuffer *> &bufs);
     // Uploads one slot's homography + facing bearing (degrees, see
     // BEV_ALGORITHM.md's yaw->facing formula) — cheap, called per keypress
     // for just the changed slot, not all N.

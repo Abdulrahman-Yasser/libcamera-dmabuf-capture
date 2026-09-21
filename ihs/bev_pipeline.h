@@ -60,6 +60,17 @@ private:
         int                         cfg_slot = 0;
         std::unique_ptr<FileSource> src;
         DmaBufFrame                 frame;
+
+        int width = 0, height = 0, stride = 0;
+
+        std::shared_ptr<libcamera::Camera>               camera;
+        std::unique_ptr<libcamera::CameraConfiguration>  config;
+        std::unique_ptr<libcamera::FrameBufferAllocator> allocator;
+        std::vector<std::unique_ptr<libcamera::Request>> requests;
+        libcamera::Stream                               *stream = nullptr;
+        std::unique_ptr<CaptureSession>                  session;
+        bool                                             acquired = false;
+        bool                                             started  = false;
     };
 
     bool init_camera();
@@ -70,6 +81,11 @@ private:
     bool render_camera();
     bool render_file();
     bool render_surround();
+    bool render_surround_live();
+    bool open_live_slot(Slot &slot, int index);
+    bool start_live_cameras();
+    void stop_live_cameras();
+    void release_live_slots();
     bool render_pattern();
 
     void pace(double frame_duration_ms);
@@ -103,6 +119,11 @@ private:
     std::vector<Slot>        slots_;
     std::vector<DmaBufFrame> frames_;
     bool                     pyramid_ = false;
+    bool                     live_    = false;
+
+    std::vector<CaptureSession *>                 live_sessions_;
+    std::vector<const libcamera::FrameBuffer *>   live_bufs_;
+    std::vector<libcamera::Request *>             live_reqs_;
 
     // Pattern mode. The motion is a function of elapsed time, not of the frame
     // counter: tying it to frames makes every hitch and every change of frame

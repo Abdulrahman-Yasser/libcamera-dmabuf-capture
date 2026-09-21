@@ -1,4 +1,5 @@
 #include "gpu_renderer.h"
+#include <string>
 #include "perf_timer.h"
 
 #include <drm/drm_fourcc.h>
@@ -375,6 +376,103 @@ void main() {
     PROCESS_CAMERA(5)
     PROCESS_CAMERA(6)
     PROCESS_CAMERA(7)
+
+    fragColor = vec4(weightSum > 0.0 ? colorSum / weightSum : vec3(0.0), 1.0);
+}
+)glsl";
+
+static const char kFS_MULTI_LIVE[] = R"glsl(
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : require
+precision mediump float;
+
+#define MAX_CAMERAS 8
+
+uniform samplerExternalOES uTex0;
+uniform samplerExternalOES uTex1;
+uniform samplerExternalOES uTex2;
+uniform samplerExternalOES uTex3;
+uniform samplerExternalOES uTex4;
+uniform samplerExternalOES uTex5;
+uniform samplerExternalOES uTex6;
+uniform samplerExternalOES uTex7;
+uniform mat3  uH[MAX_CAMERAS];
+uniform float uFacingDeg[MAX_CAMERAS];
+uniform vec4  uDist0[MAX_CAMERAS];
+uniform vec4  uDist1[MAX_CAMERAS];
+uniform vec2  uDist2[MAX_CAMERAS];
+uniform int   uNumCameras;
+
+uniform float uBevWidth;
+uniform float uBevHeight;
+uniform float uPxPerM;
+
+uniform float uOverlap;
+uniform float uBlendEdge;
+uniform float uFreeYaw;
+uniform float uUseCoverageWeight;
+
+out vec4 fragColor;
+
+const float kPi = 3.14159265358979;
+
+#define PROCESS_CAMERA(IDX, TEX)                                               \
+    if (IDX < uNumCameras) {                                                 \
+        vec3 s  = uH[IDX] * p;                                              \
+        vec2 uv = s.xy / s.z;                                               \
+        if (uDist2[IDX].y > 0.5) {                                          \
+            vec4 d0 = uDist0[IDX]; vec4 d1 = uDist1[IDX];                   \
+            float p2v = uDist2[IDX].x;                                     \
+            float x = (uv.x - d0.z) / d0.x;                                \
+            float y = (uv.y - d0.w) / d0.y;                                \
+            float r2 = x*x + y*y;                                          \
+            float radial = 1.0 + d1.x*r2 + d1.y*r2*r2 + d1.z*r2*r2*r2;      \
+            float xd = x*radial + 2.0*d1.w*x*y + p2v*(r2 + 2.0*x*x);        \
+            float yd = y*radial + d1.w*(r2 + 2.0*y*y) + 2.0*p2v*x*y;        \
+            uv = vec2(d0.x*xd + d0.z, d0.y*yd + d0.w);                     \
+        }                                                                    \
+        bool ok = s.z > 0.0 && all(greaterThanEqual(uv, vec2(0.0)))         \
+                            && all(lessThanEqual(uv, vec2(1.0)));           \
+        if (ok) {                                                           \
+            float w;                                                        \
+            if (uUseCoverageWeight > 0.5) {                                 \
+                vec2  margin2 = min(uv, vec2(1.0) - uv);                    \
+                float margin  = min(margin2.x, margin2.y);                 \
+                w = smoothstep(0.0, max(uBlendEdge, 1e-4), margin);         \
+            } else if (uFreeYaw > 0.5) {                                    \
+                w = 1.0;                                                    \
+            } else {                                                        \
+                float d   = mod(thetaFrag - radians(uFacingDeg[IDX]) + kPi, \
+                                2.0 * kPi) - kPi;                           \
+                float raw = clamp(1.0 - abs(d) / radians(uOverlap), 0.0, 1.0);\
+                w = smoothstep(uBlendEdge, 1.0 - uBlendEdge, raw);          \
+            }                                                               \
+            if (w > 0.0) {                                                  \
+                vec3  c  = texture(TEX, uv).rgb;                     \
+                colorSum  += c * w;                                         \
+                weightSum += w;                                            \
+            }                                                               \
+        }                                                                    \
+    }
+
+void main() {
+    vec3 p = vec3(gl_FragCoord.x, uBevHeight - gl_FragCoord.y, 1.0);
+
+    float worldX    = (gl_FragCoord.x - uBevWidth  * 0.5) / uPxPerM;
+    float worldY    = (gl_FragCoord.y - uBevHeight * 0.5) / uPxPerM;
+    float thetaFrag = atan(worldY, worldX);
+
+    vec3  colorSum  = vec3(0.0);
+    float weightSum = 0.0;
+
+    PROCESS_CAMERA(0, uTex0)
+    PROCESS_CAMERA(1, uTex1)
+    PROCESS_CAMERA(2, uTex2)
+    PROCESS_CAMERA(3, uTex3)
+    PROCESS_CAMERA(4, uTex4)
+    PROCESS_CAMERA(5, uTex5)
+    PROCESS_CAMERA(6, uTex6)
+    PROCESS_CAMERA(7, uTex7)
 
     fragColor = vec4(weightSum > 0.0 ? colorSum / weightSum : vec3(0.0), 1.0);
 }
@@ -1387,6 +1485,61 @@ bool GpuRenderer::init_multi(const EGLState &egl, int w, int h, int stride, int 
     return true;
 }
 
+bool GpuRenderer::init_multi_live(const EGLState &egl, int w, int h, int stride, int num_cameras)
+{
+    if (num_cameras < 1 || num_cameras > kMaxCameras) {
+        std::cerr << "[gpu] init_multi_live: num_cameras=" << num_cameras
+                  << " out of range [1," << kMaxCameras << "]\n";
+        return false;
+    }
+
+    if (!init(egl, w, h, stride)) return false;
+
+    double t0 = now_ms();
+    std::string live_src = kFS_MULTI_LIVE;
+    for (int k = num_cameras; k < kMaxCameras; ++k) {
+        std::string line = "    PROCESS_CAMERA(" + std::to_string(k) + ", uTex" + std::to_string(k) + ")\n";
+        size_t pos = live_src.find(line);
+        if (pos != std::string::npos) live_src.erase(pos, line.size());
+    }
+    prog_multi_ = build_program(kVS, live_src.c_str());
+    if (!prog_multi_) return false;
+    std::printf("[gpu] multi-live (%d-camera) shader compile+link : %.1f ms\n",
+                num_cameras, now_ms() - t0);
+
+    glUseProgram(prog_multi_);
+    char name[32];
+    for (int i = 0; i < num_cameras; ++i) {
+        std::snprintf(name, sizeof(name), "uTex%d", i);
+        glUniform1i(glGetUniformLocation(prog_multi_, name), i);
+
+        std::snprintf(name, sizeof(name), "uH[%d]", i);
+        u_H_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uFacingDeg[%d]", i);
+        u_facing_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uDist0[%d]", i);
+        u_dist0_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uDist1[%d]", i);
+        u_dist1_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        std::snprintf(name, sizeof(name), "uDist2[%d]", i);
+        u_dist2_multi_[i] = glGetUniformLocation(prog_multi_, name);
+        glUniform2f(u_dist2_multi_[i], 0.0f, 0.0f);
+    }
+    glUniform1i(glGetUniformLocation(prog_multi_, "uNumCameras"), num_cameras);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uOverlap"),    60.0f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uBlendEdge"), 0.45f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uFreeYaw"),    0.0f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uUseCoverageWeight"), 0.0f);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uBevWidth"),  (float)w);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uBevHeight"), (float)h);
+    glUniform1f(glGetUniformLocation(prog_multi_, "uPxPerM"),    100.0f);
+
+    num_cameras_multi_ = num_cameras;
+    std::printf("[gpu] renderer ready (%d-camera live surround mode): %dx%d\n",
+                num_cameras, W_, H_);
+    return true;
+}
+
 void GpuRenderer::set_ipm_multi(int slot, const float H[9], float facing_deg)
 {
     if (!prog_multi_ || slot < 0 || slot >= num_cameras_multi_) return;
@@ -1450,6 +1603,39 @@ void GpuRenderer::render_frame_multi(const std::vector<DmaBufFrame> &frames)
     int n = std::min((int)frames.size(), num_cameras_multi_);
     for (int i = 0; i < n; ++i)
         upload_nv12(frames[i], tex_y_multi_[i], tex_uv_multi_[i], 2 * i, 2 * i + 1);
+
+    glUseProgram(prog_multi_);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+    glViewport(0, 0, W_, H_);
+
+    if (gpu_stats_.available) pfn_BeginQuery(GL_TIME_ELAPSED_EXT, timer_query_);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (gpu_stats_.available) { pfn_EndQuery(GL_TIME_ELAPSED_EXT); timer_pending_ = true; }
+    draw_car_icon();
+    glFlush();
+}
+
+void GpuRenderer::render_frame_multi_live(const std::vector<const libcamera::FrameBuffer *> &bufs)
+{
+    collect_timer();
+
+    int n = std::min((int)bufs.size(), num_cameras_multi_);
+    for (int i = 0; i < n; ++i) {
+        int fd = bufs[i]->planes()[0].fd.get();
+        auto it = fd_cache_.find(fd);
+        if (it == fd_cache_.end()) {
+            EGLImageKHR img = create_egl_image(bufs[i]);
+            if (img == EGL_NO_IMAGE_KHR) {
+                std::cerr << "[gpu] eglCreateImageKHR failed for fd=" << fd
+                          << " (0x" << std::hex << eglGetError() << std::dec << ")\n";
+                return;
+            }
+            cache_frame(fd, img);
+            it = fd_cache_.find(fd);
+        }
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, it->second.texture);
+    }
 
     glUseProgram(prog_multi_);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
