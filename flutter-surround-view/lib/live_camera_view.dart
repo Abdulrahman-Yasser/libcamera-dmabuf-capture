@@ -1,10 +1,13 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:bev_view/bev_view.dart';
 import 'package:flutter/material.dart';
 
 import 'bev_source.dart';
 import 'models.dart';
 
-class LiveCameraView extends StatelessWidget {
+class LiveCameraView extends StatefulWidget {
   const LiveCameraView({
     super.key,
     required this.camera,
@@ -17,7 +20,34 @@ class LiveCameraView extends StatelessWidget {
   final bool showLabel;
 
   @override
+  State<LiveCameraView> createState() => _LiveCameraViewState();
+}
+
+class _LiveCameraViewState extends State<LiveCameraView> {
+  static final bool _showStats = Platform.environment['BEV_STAT'] == '1';
+
+  Timer? _poll;
+  BevStats? _stats;
+
+  @override
+  void dispose() {
+    _poll?.cancel();
+    super.dispose();
+  }
+
+  void _onCreated(BevViewController controller) {
+    if (!_showStats) return;
+    _poll = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      final BevStats? stats = controller.stats();
+      if (!mounted) return;
+      setState(() => _stats = stats);
+    });
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final CameraId camera = widget.camera;
+    final bool birdsEye = widget.birdsEye;
     final int index = camera.cameraIndex!;
     final BevSource source = birdsEye
         ? birdsEyeSourceFromEnvironment(index)
@@ -36,8 +66,34 @@ class LiveCameraView extends StatelessWidget {
           BevView(
             key: ValueKey<String>('${camera.name}-$birdsEye'),
             source: source,
+            onCreated: _onCreated,
           ),
-          if (showLabel)
+          if (_showStats && _stats != null)
+            Positioned(
+              right: 8,
+              top: 8,
+              child: IgnorePointer(
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Colors.black54,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    child: Text(
+                      '${_stats!.fps.toStringAsFixed(1)} fps',
+                      style: const TextStyle(
+                        fontFamily: 'monospace',
+                        fontSize: 13,
+                        color: Colors.white,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          if (widget.showLabel)
             Positioned(
               left: 8,
               top: 8,

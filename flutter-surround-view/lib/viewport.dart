@@ -23,8 +23,11 @@ class CameraViewport extends StatelessWidget {
     final Widget content = switch (mode) {
       ViewMode.surround360 => const SurroundView(),
       ViewMode.sideViews => _SideViews(subViews: camSubViews),
-      ViewMode.frontRear =>
-        CameraBox(camera: frontRearCamera, showLabel: true),
+      ViewMode.frontRear => SingleCameraView(
+          camera: frontRearCamera,
+          subView: camSubViews[frontRearCamera]!,
+          showLabel: true,
+        ),
       _ => SingleCameraView(
           camera: mode.asCamera!,
           subView: camSubViews[mode.asCamera!]!,

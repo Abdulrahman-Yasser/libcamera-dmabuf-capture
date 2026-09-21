@@ -12,3 +12,9 @@ extern/
 
 # JetBrains project files
 .idea/
+
+# Flutter and IDE generated files
+compile_commands.json
+flutter-surround-view/.dart_tool/
+flutter-surround-view/linux/
+flutter-surround-view/libapp.so.*
