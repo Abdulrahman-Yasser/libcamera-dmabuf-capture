@@ -5,6 +5,7 @@
 #include "perf_timer.h"
 #include "ipm.h"
 #include "bev_config.h"
+#include "bev_setup.h"
 #ifdef HAVE_WAYLAND_PREVIEW
 #include "wayland_window.h"
 #endif
@@ -30,63 +31,8 @@
 
 using namespace libcamera;
 
-// Drop-in for ground_to_image_H() when the pose is measured, not tuned.
-// Reuses the same BEV-pixel -> ground mapping M; board centre (0.27,0.36 m)
-// is offset to the canvas centre so it renders centred.
-//
-// dx/dy/dyaw_deg let a calibrated (has_hb2i) slot still be live-tuned: they
-// are this slot's cam_x/cam_y/yaw *delta* away from the pose the ChArUco
-// shot was taken at (0 = untouched, reproduces the original fixed-Hb2i
-// behavior exactly). A ground-plane position+heading offset is the only
-// thing that can be validly composed on top of an opaque, already-
-// calibrated Hb2i -- cam_h/pitch are baked into Hb2i itself (the camera's
-// actual height/tilt when the board was shot) and can't be recovered or
-// re-applied without decomposing Hb2i back into K/R/t, so those two knobs
-// are intentionally inert for calibrated slots (see the H/h/P/p keyboard
-// handlers' warning below).
-// Resolution the ChArUco board->image homographies (kHb2i_A/kHb2i_B in
-// bev_config.cpp's bev_config_defaults()) were actually measured at --
-// fixed, independent of img_w/img_h below (the runtime video's own frame
-// size), which can be a different resolution entirely. Hb2i's raw output is
-// in calibration-image pixels, so normalizing by anything other than the
-// resolution it was measured at would silently rescale the homography.
-static constexpr double CAL_W = 3280.0, CAL_H = 2464.0;
-
-static mat3 measured_H(const mat3 &Hb2i, int img_w, int img_h,
-                       double px_per_m, int bev_w, int bev_h,
-                       double dx = 0.0, double dy = 0.0, double dyaw_deg = 0.0) {
-    (void)img_w; (void)img_h; // kept for call-site compatibility; see CAL_W/CAL_H above
-    const double r = px_per_m;
-    const double Xc = 0.27, Yc = 0.36;
-    mat3 S;
-    S.at(0,0)= 1.0/r; S.at(0,1)= 0.0;   S.at(0,2)= -(bev_w/2.0)/r + Xc;
-    S.at(1,0)= 0.0;   S.at(1,1)=-1.0/r; S.at(1,2)=  (bev_h/2.0)/r + Yc;
-    S.at(2,0)= 0.0;   S.at(2,1)= 0.0;   S.at(2,2)= 1.0;
-
-    // Rigid transform in board-metre space: rotate by dyaw about the board
-    // origin, then translate by (dx,dy). Identity when untouched, so an
-    // un-tuned slot renders exactly as before this fix.
-    const double rad = dyaw_deg * M_PI / 180.0;
-    const double ca = std::cos(rad), sa = std::sin(rad);
-    mat3 T;
-    T.at(0,0)= ca; T.at(0,1)=-sa; T.at(0,2)= dx;
-    T.at(1,0)= sa; T.at(1,1)= ca; T.at(1,2)= dy;
-    T.at(2,0)= 0;  T.at(2,1)=  0; T.at(2,2)= 1;
-
-    mat3 H = Hb2i * T * S;
-    for (int col = 0; col < 3; ++col) { H.at(0,col) /= CAL_W; H.at(1,col) /= CAL_H; }
-    return H;
-}
-
-// Naming-convention lookup for a per-lens-model distortion file:
-// "<lens_dir>/<lens_model>-lens.ini". lens_model is used verbatim -- no
-// hyphenation normalization -- so "imx219" and "imx-219" are two different
-// files, consistently with whatever the user actually typed/saved.
-static std::string lens_calib_path(const std::string &lens_dir, const std::string &lens_model)
-{
-    if (lens_dir.empty() || lens_dir.back() == '/') return lens_dir + lens_model + "-lens.ini";
-    return lens_dir + "/" + lens_model + "-lens.ini";
-}
+// measured_H() and lens_calib_path() live in bev_setup.h, shared with the
+// ivi-homescreen platform view (ihs/bev_pipeline.cpp).
 
 // Points at the active WaylandPreviewWindow, or null when --preview wasn't
 // requested / this build has no preview support. Kept as a plain type alias

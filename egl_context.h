@@ -16,7 +16,9 @@ struct EGLState {
 };
 
 // Headless, surfaceless GBM context — default pipeline-testing path.
-bool setup_egl(EGLState &egl);
+// `render_node` defaults to the Pi's only GPU; the platform view (ihs/) passes
+// the node that matches the shell's device on a multi-GPU host.
+bool setup_egl(EGLState &egl, const char *render_node = "/dev/dri/renderD128");
 
 #ifdef HAVE_WAYLAND_PREVIEW
 // Windowed EGL context bound to a Wayland surface — used by --preview.

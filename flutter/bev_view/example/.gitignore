@@ -1,0 +1,13 @@
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+pubspec.lock
+
+# Assembled shell bundle (run.sh). Rebuilt every run: a stale one serves old
+# Dart against a current native library, which reads as an app bug.
+.ivi-bundle/
+# run.sh stages a desktop shell + engine here to run the example on the host.
+.desktop-homescreen/
+# AOT product left beside the bundle by an --mode release host run.
+libapp.so*

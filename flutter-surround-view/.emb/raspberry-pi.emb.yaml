@@ -1,0 +1,41 @@
+# App layer for the BEV platform view on Raspberry Pi.
+#
+# emb merges this over ivi-homescreen's project manifest when the shell build
+# is given `--app <this directory>`, so it states only what this app adds to
+# the board + embedder stack:
+#
+#   emb cross /path/to/ivi-homescreen --target rpi4-trixie --build \
+#     --backend drm-kms-egl \
+#     --app /path/to/libcamera-dmabuf-capture/flutter/bev_view/example \
+#     --mode release --deploy <user>@<host> --deploy-dir bev-view --run
+#
+# The pipeline's own dependencies mostly come for free: libcamera and
+# GStreamer from ivi-homescreen's Pi targets, and EGL/GLES, DRM, gbm and the
+# Vulkan loader from emb's board library. libpng is the one this app needs and
+# nothing above it does -- gpu_renderer.cpp encodes snapshots with it.
+#
+# libbev_view.so itself is built by the package's Dart build hook during the
+# app build, not declared as a `cross.modules` entry: the hook is what produces
+# the native-assets manifest the @Native bindings resolve through, and it
+# inherits emb's cross toolchain because it drives plain `cmake` (emb puts a
+# wrapper naming CMAKE_TOOLCHAIN_FILE on PATH for exactly this).
+id: surround_view
+type: app
+supported_archs: [arm64]
+supported_host_types: [fedora, ubuntu]
+
+cross:
+  targets:
+    rpi4-trixie:
+      sysroot:
+        dev_packages: &bev_packages
+          - libpng-dev
+    rpi5-trixie:
+      sysroot:
+        dev_packages: *bev_packages
+    rpi4-bookworm:
+      sysroot:
+        dev_packages: *bev_packages
+    rpi5-bookworm:
+      sysroot:
+        dev_packages: *bev_packages

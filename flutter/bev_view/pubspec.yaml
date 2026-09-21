@@ -1,0 +1,24 @@
+name: bev_view
+description: >
+  The libcamera-dmabuf-capture surround-view (BEV) pipeline as an ivi-homescreen
+  platform view. A native-assets hook builds libbev_view.so from this
+  repository's CMake project; the view renders with GLES and hands the shell
+  dma-bufs on both its EGL and Vulkan backends.
+version: 0.1.0
+publish_to: none
+
+environment:
+  sdk: ^3.8.0
+  flutter: ">=3.27.1"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+  # Only hook/build.dart uses these; the ranges stay wide so pub can pick what
+  # the surrounding Flutter SDK admits.
+  code_assets: ">=0.19.7 <3.0.0"
+  hooks: ">=0.20.1 <3.0.0"
+
+dev_dependencies:
+  flutter_lints: ">=4.0.0 <7.0.0"
