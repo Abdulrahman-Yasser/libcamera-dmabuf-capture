@@ -777,26 +777,8 @@ uniform samplerExternalOES uTexture;
 in  vec2 vTexCoord;
 out vec4 fragColor;
 void main() {
-    /* Flip Y: DMA-BUF origin is top-left, GL UV origin is bottom-left. */
-    vec2 uv  = vec2(vTexCoord.x, 1.0 - vTexCoord.y);
-    vec3 rgb = texture(uTexture, uv).rgb;
-
-    /* Red tint: boost red channel, suppress green and blue. */
-    vec3 tinted = vec3(min(rgb.r * 1.5, 1.0), rgb.g * 0.5, rgb.b * 0.5);
-
-    /* Parking guide grid:
-     *  3 horizontal lines at 25%, 50%, 75% — depth cues
-     *  2 vertical lines at 33%, 66%        — lane boundaries
-     */
-    float lw = 0.005;
-    float h1 = 1.0 - step(lw, abs(uv.y - 0.25));
-    float h2 = 1.0 - step(lw, abs(uv.y - 0.50));
-    float h3 = 1.0 - step(lw, abs(uv.y - 0.75));
-    float v1 = 1.0 - step(lw, abs(uv.x - 0.33));
-    float v2 = 1.0 - step(lw, abs(uv.x - 0.66));
-    float grid = max(max(max(h1, h2), max(h3, v1)), v2);
-
-    fragColor = vec4(mix(tinted, vec3(1.0), grid), 1.0);
+    vec2 uv = vec2(vTexCoord.x, 1.0 - vTexCoord.y);
+    fragColor = vec4(texture(uTexture, uv).rgb, 1.0);
 }
 )glsl";
 

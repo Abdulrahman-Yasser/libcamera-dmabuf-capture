@@ -1,8 +1,7 @@
-import 'package:bev_view/bev_view.dart';
 import 'package:flutter/material.dart';
 
-import 'bev_source.dart';
 import 'models.dart';
+import 'surround_view.dart';
 
 class CameraViewport extends StatelessWidget {
   const CameraViewport({
@@ -18,12 +17,10 @@ class CameraViewport extends StatelessWidget {
   final CameraId frontRearCamera;
   final Map<CameraId, CameraSubView> camSubViews;
 
-  static final BevSource _surroundSource = surroundSourceFromEnvironment();
-
   @override
   Widget build(BuildContext context) {
     final Widget content = switch (mode) {
-      ViewMode.surround360 => BevView(source: _surroundSource),
+      ViewMode.surround360 => const SurroundView(),
       ViewMode.sideViews => _SideViews(subViews: camSubViews),
       ViewMode.frontRear =>
         CameraBox(camera: frontRearCamera, showLabel: true),

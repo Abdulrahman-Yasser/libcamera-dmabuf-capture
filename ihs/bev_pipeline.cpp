@@ -45,6 +45,15 @@ std::shared_ptr<CameraManager> acquire_camera_manager(const std::string &tuning_
     return started;
 }
 
+bool acquire_camera(libcamera::Camera &camera)
+{
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        if (camera.acquire() == 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
+}
+
 } // namespace
 
 bool BevPipeline::init(const EGLState &egl, const BevParams &params)
@@ -169,7 +178,7 @@ bool BevPipeline::init_camera()
     }
     camera_ = cameras[(size_t)params_.camera_index];
     std::printf("[bev/camera] camera: %s\n", camera_->id().c_str());
-    if (camera_->acquire()) {
+    if (!acquire_camera(*camera_)) {
         std::fprintf(stderr, "[bev/camera] %s is in use\n", camera_->id().c_str());
         return false;
     }
@@ -289,6 +298,12 @@ bool BevPipeline::init_surround()
     if (n < 1 || n > max_cams) {
         std::fprintf(stderr, "[bev/surround] %d source(s), must be 1..%d\n", n, max_cams);
         return false;
+    }
+
+    for (int i = 0; i < n; ++i) {
+        const std::string &src = params_.sources[(size_t)i];
+        if (src.rfind("camera:", 0) == 0)
+            params_.cfg_slots[(size_t)i] = std::atoi(src.c_str() + 7);
     }
 
     BevConfig cfg;
@@ -446,7 +461,7 @@ bool BevPipeline::open_live_slot(Slot &slot, int index)
     }
     slot.camera = cameras[(size_t)index];
     std::printf("[bev/surround] camera %d: %s\n", index, slot.camera->id().c_str());
-    if (slot.camera->acquire()) {
+    if (!acquire_camera(*slot.camera)) {
         std::fprintf(stderr, "[bev/surround] %s is in use\n", slot.camera->id().c_str());
         return false;
     }
