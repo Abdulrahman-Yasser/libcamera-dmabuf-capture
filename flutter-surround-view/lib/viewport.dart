@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import 'live_camera_view.dart';
 import 'models.dart';
 import 'surround_view.dart';
 
@@ -117,6 +118,15 @@ class SingleCameraView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (camera.cameraIndex != null) {
+      return switch (subView) {
+        CameraSubView.normal =>
+          LiveCameraView(camera: camera, birdsEye: false, showLabel: showLabel),
+        CameraSubView.bev =>
+          LiveCameraView(camera: camera, birdsEye: true, showLabel: showLabel),
+        _ => _CameraSubViewPlaceholder(camera: camera, subView: subView),
+      };
+    }
     return switch (subView) {
       CameraSubView.normal => CameraBox(camera: camera, showLabel: showLabel),
       _ => _CameraSubViewPlaceholder(camera: camera, subView: subView),

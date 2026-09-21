@@ -40,6 +40,12 @@ enum CameraId {
       };
 
   String get asset => 'assets/$name.png';
+
+  int? get cameraIndex => switch (this) {
+        CameraId.front => 0,
+        CameraId.right => 1,
+        _ => null,
+      };
 }
 
 enum CameraSubView {
